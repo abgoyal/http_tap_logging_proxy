@@ -1,7 +1,7 @@
 BINARY := http-tap-proxy
 LDFLAGS := -ldflags "-s -w"
 
-.PHONY: build build-linux build-windows test test-short bench lint clean
+.PHONY: build build-linux build-windows test test-short bench lint deadcode check clean
 
 # Default build for current platform
 build:
@@ -26,11 +26,18 @@ test-short:
 bench:
 	go test -bench=. -benchtime=2s -timeout 120s
 
-# Lint and format
+# Lint with golangci-lint
 lint:
 	go fmt ./...
 	go vet ./...
-	@which golangci-lint > /dev/null 2>&1 && golangci-lint run || echo "golangci-lint not installed, skipping"
+	golangci-lint run ./...
+
+# Check for dead code
+deadcode:
+	go run golang.org/x/tools/cmd/deadcode@latest ./...
+
+# Run all checks (lint + deadcode)
+check: lint deadcode
 
 # Clean build artifacts
 clean:

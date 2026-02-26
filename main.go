@@ -584,11 +584,6 @@ func (p *Proxy) Close() error {
 	return nil
 }
 
-// Wait blocks until all servers have stopped
-func (p *Proxy) Wait() {
-	p.wg.Wait()
-}
-
 func (p *Proxy) getTLSConfig() (*tls.Config, error) {
 	if p.cfg.AutoCert {
 		cert, err := generateSelfSignedCert()
