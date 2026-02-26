@@ -1,0 +1,40 @@
+version: 2
+project_name: http-tap-proxy
+
+builds:
+  - id: http-tap-proxy
+    binary: '{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}_{{ .Version }}'
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - windows
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+    main: .
+    ldflags:
+      - -s -w
+
+archives:
+  - id: http-tap-proxy-archive
+    format: binary
+
+checksum:
+  name_template: 'checksums.txt'
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+
+release:
+  prerelease: auto
+  replace_existing_artifacts: true
