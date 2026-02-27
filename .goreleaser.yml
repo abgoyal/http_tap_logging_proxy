@@ -3,7 +3,7 @@ project_name: http-tap-proxy
 
 builds:
   - id: http-tap-proxy
-    binary: '{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}_{{ .Version }}'
+    binary: '{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}_{{ .Tag }}'
     env:
       - CGO_ENABLED=0
     goos:
@@ -16,13 +16,16 @@ builds:
     ignore:
       - goos: windows
         goarch: arm64
-    main: .
+    main: ./
     ldflags:
       - -s -w
 
 archives:
   - id: http-tap-proxy-archive
-    format: binary
+    formats: binary
+    wrap_in_directory: false
+    strip_binary_directory: true
+    name_template: '{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}_{{ .Tag }}'
 
 checksum:
   name_template: 'checksums.txt'
