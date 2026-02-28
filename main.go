@@ -127,8 +127,8 @@ type ProxyMetrics struct {
 // LogEntry represents a logged HTTP transaction
 type LogEntry struct {
 	ID             string       `json:"id"`
-	RouteName      string       `json:"route_name"`                // Proxy route name
-	CorrelationID  string       `json:"correlation_id,omitempty"`  // From X-Request-ID or X-Correlation-ID header
+	RouteName      string       `json:"route_name"`               // Proxy route name
+	CorrelationID  string       `json:"correlation_id,omitempty"` // From X-Request-ID or X-Correlation-ID header
 	Timestamp      time.Time    `json:"timestamp"`
 	DurationMs     int64        `json:"duration_ms"`
 	TTFBRequestMs  int64        `json:"ttfb_request_ms,omitempty"`  // Time to first byte of request body received
@@ -273,6 +273,9 @@ type TapTransport struct {
 
 // Global config (used only by main for verbose logging)
 var cfg *Config
+
+// proxyNameRegex validates proxy names for Prometheus label and filename safety
+var proxyNameRegex = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_-]*$`)
 
 // NewProxy creates a new proxy instance with the given configuration
 func NewProxy(pc *ProxyConfig, globalCfg *Config, logManager *LogManager) (*Proxy, error) {
@@ -773,18 +776,6 @@ func main() {
 	log.Println("Shutdown complete")
 }
 
-// multiStringFlag allows specifying a flag multiple times
-type multiStringFlag []string
-
-func (m *multiStringFlag) String() string {
-	return strings.Join(*m, ",")
-}
-
-func (m *multiStringFlag) Set(value string) error {
-	*m = append(*m, value)
-	return nil
-}
-
 // proxyFlag collects multiple --proxy flag values
 type proxyFlag []string
 
@@ -814,7 +805,7 @@ func parseProxyFlag(value string) (*ProxyConfig, error) {
 		switch k {
 		case "name":
 			// Validate name for Prometheus label safety and filename safety
-			if matched, _ := regexp.MatchString(`^[a-zA-Z][a-zA-Z0-9_-]*$`, v); !matched {
+			if !proxyNameRegex.MatchString(v) {
 				return nil, fmt.Errorf("proxy name %q is invalid (must start with letter, only alphanumeric/underscore/hyphen allowed)", v)
 			}
 			pc.Name = v
@@ -1003,12 +994,6 @@ func parseSize(s string) (int64, error) {
 	var num int64
 	_, err := fmt.Sscanf(s, "%d", &num)
 	return num, err
-}
-
-func sanitizeFilename(s string) string {
-	// Replace characters that are problematic in filenames
-	re := regexp.MustCompile(`[^a-zA-Z0-9\-_.]`)
-	return re.ReplaceAllString(s, "-")
 }
 
 // resolveLogPath determines the actual log path for a proxy.
