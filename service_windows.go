@@ -3,8 +3,11 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,8 +22,11 @@ const serviceName = "http-tap-proxy"
 const serviceDisplayName = "HTTP Tap Proxy"
 const serviceDescription = "A transparent HTTP/HTTPS logging proxy"
 
-// serviceProxy holds the running proxy instance for Windows service mode
-var serviceProxy *Proxy
+// serviceProxies holds the running proxy instances for Windows service mode
+var serviceProxies []*Proxy
+var serviceLogManager *LogManager
+var serviceAdminServer *http.Server
+var serviceAdminListener net.Listener
 
 type httpTapService struct{}
 
@@ -29,21 +35,35 @@ func (m *httpTapService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 
 	changes <- svc.Status{State: svc.StartPending}
 
-	// Start the proxy
 	var err error
-	serviceProxy, err = NewProxy(cfg)
+	serviceProxies, serviceLogManager, err = initProxies(cfg)
 	if err != nil {
-		log.Printf("Failed to create proxy: %v", err)
+		log.Printf("Failed to initialize proxies: %v", err)
 		return false, 1
 	}
 
-	if err := serviceProxy.Start(); err != nil {
-		log.Printf("Failed to start proxy: %v", err)
-		return false, 1
+	// Start admin server if configured
+	startTime := time.Now()
+	if cfg.ListenAdmin != "" {
+		serviceAdminListener, err = net.Listen("tcp", cfg.ListenAdmin)
+		if err != nil {
+			log.Printf("Failed to listen on admin port %s: %v", cfg.ListenAdmin, err)
+			return false, 1
+		}
+
+		serviceAdminServer = &http.Server{Handler: createAdminHandler(serviceProxies, startTime, cfg)}
+		go func() {
+			if err := serviceAdminServer.Serve(serviceAdminListener); err != http.ErrServerClosed {
+				log.Printf("Admin server error: %v", err)
+			}
+		}()
+		log.Printf("Admin (health/metrics): %s", serviceAdminListener.Addr().String())
 	}
 
 	log.Printf("HTTP Tap Proxy v%s started as Windows service", Version)
-	log.Printf("Upstream: %s", cfg.Upstream)
+	for _, p := range serviceProxies {
+		log.Printf("Proxy %q: upstream=%s", p.name, p.proxyCfg.Upstream)
+	}
 
 	changes <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
 
@@ -55,9 +75,19 @@ func (m *httpTapService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 				changes <- c.CurrentStatus
 			case svc.Stop, svc.Shutdown:
 				changes <- svc.Status{State: svc.StopPending}
-				// Signal shutdown
-				if serviceProxy != nil {
-					_ = serviceProxy.Close()
+				// Shutdown admin server
+				if serviceAdminServer != nil {
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					_ = serviceAdminServer.Shutdown(ctx)
+					cancel()
+				}
+				// Shutdown all proxies
+				for _, p := range serviceProxies {
+					_ = p.Close()
+				}
+				// Stop log manager
+				if serviceLogManager != nil {
+					serviceLogManager.Stop()
 				}
 				return
 			default:
@@ -109,17 +139,39 @@ func installService() {
 		log.Fatalf("Service %s already exists", serviceName)
 	}
 
-	// Build service arguments (exclude --service install)
+	// Build service arguments
 	var args []string
 	args = append(args, "--service", "run")
-	if cfg.ListenHTTP != "" {
-		args = append(args, "--listen-http", cfg.ListenHTTP)
+
+	// Add proxy definitions
+	for _, pc := range cfg.Proxies {
+		var proxyParts []string
+		proxyParts = append(proxyParts, "name="+pc.Name)
+		if pc.ListenHTTP != "" {
+			proxyParts = append(proxyParts, "listen_http="+pc.ListenHTTP)
+		}
+		if pc.ListenHTTPS != "" {
+			proxyParts = append(proxyParts, "listen_https="+pc.ListenHTTPS)
+		}
+		proxyParts = append(proxyParts, "upstream="+pc.Upstream)
+		if pc.LogJSONL != "" {
+			proxyParts = append(proxyParts, "log_jsonl="+pc.LogJSONL)
+		}
+		if pc.LogSQLite != "" {
+			proxyParts = append(proxyParts, "log_sqlite="+pc.LogSQLite)
+		}
+		for _, pattern := range pc.IncludePathsRegex {
+			proxyParts = append(proxyParts, "include_path="+pattern)
+		}
+		for _, pattern := range pc.ExcludePathsRegex {
+			proxyParts = append(proxyParts, "exclude_path="+pattern)
+		}
+		args = append(args, "--proxy", strings.Join(proxyParts, ","))
 	}
-	if cfg.ListenHTTPS != "" {
-		args = append(args, "--listen-https", cfg.ListenHTTPS)
-	}
-	if cfg.Upstream != "" {
-		args = append(args, "--upstream", cfg.Upstream)
+
+	// Global settings
+	if cfg.ListenAdmin != "" {
+		args = append(args, "--listen-admin", cfg.ListenAdmin)
 	}
 	if cfg.LogJSONL != "" {
 		args = append(args, "--log-jsonl", cfg.LogJSONL)

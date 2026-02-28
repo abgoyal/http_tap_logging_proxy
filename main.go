@@ -53,14 +53,26 @@ import (
 // Version information
 const Version = "1.0.0"
 
-// Configuration holds all CLI parameters
+// ProxyConfig holds configuration for a single proxy instance
+type ProxyConfig struct {
+	Name              string           // Proxy name (used in logs, filenames)
+	ListenHTTP        string           // HTTP listen address
+	ListenHTTPS       string           // HTTPS listen address
+	Upstream          string           // Upstream URL
+	LogJSONL          string           // Per-proxy JSONL log path (overrides global)
+	LogSQLite         string           // Per-proxy SQLite log path (overrides global)
+	ExcludePathsRegex []string         // Paths to exclude from logging (regex)
+	IncludePathsRegex []string         // If set, only log paths matching these (regex)
+	excludePatterns   []*regexp.Regexp // compiled exclude patterns
+	includePatterns   []*regexp.Regexp // compiled include patterns
+}
+
+// Config holds global CLI parameters
 type Config struct {
-	ListenHTTP         string
-	ListenHTTPS        string
-	ListenAdmin        string // Separate port for health/metrics endpoints
-	Upstream           string
-	LogJSONL           string
-	LogSQLite          string
+	Proxies            []ProxyConfig // Multiple proxy configurations
+	ListenAdmin        string        // Separate port for health/metrics endpoints
+	LogJSONL           string        // Global JSONL log path (directory or file)
+	LogSQLite          string        // Global SQLite log path (directory or file)
 	RotateSize         int64
 	RotateInterval     time.Duration
 	Retention          int
@@ -77,23 +89,19 @@ type Config struct {
 	Verbose            bool
 	HealthPath         string
 	MetricsPath        string
-	ExcludePathsRegex  []string         // Paths to exclude from logging (regex)
-	IncludePathsRegex  []string         // If set, only log paths matching these (regex)
-	excludePatterns    []*regexp.Regexp // compiled exclude patterns
-	includePatterns    []*regexp.Regexp // compiled include patterns
 }
 
 // Proxy is the main HTTP tap proxy server
 type Proxy struct {
-	cfg           *Config
+	name          string       // Proxy name for logging
+	proxyCfg      *ProxyConfig // Per-proxy configuration
+	globalCfg     *Config      // Global configuration
 	upstreamURL   *url.URL
 	logManager    *LogManager
 	httpServer    *http.Server
 	httpsServer   *http.Server
-	adminServer   *http.Server
 	httpListener  net.Listener
 	httpsListener net.Listener
-	adminListener net.Listener
 	handler       http.Handler
 	wg            sync.WaitGroup
 	mu            sync.Mutex
@@ -119,7 +127,8 @@ type ProxyMetrics struct {
 // LogEntry represents a logged HTTP transaction
 type LogEntry struct {
 	ID             string       `json:"id"`
-	CorrelationID  string       `json:"correlation_id,omitempty"` // From X-Request-ID or X-Correlation-ID header
+	RouteName      string       `json:"route_name"`                // Proxy route name
+	CorrelationID  string       `json:"correlation_id,omitempty"`  // From X-Request-ID or X-Correlation-ID header
 	Timestamp      time.Time    `json:"timestamp"`
 	DurationMs     int64        `json:"duration_ms"`
 	TTFBRequestMs  int64        `json:"ttfb_request_ms,omitempty"`  // Time to first byte of request body received
@@ -159,6 +168,7 @@ type ResponseLog struct {
 // WebSocketFrame represents a single WebSocket frame
 type WebSocketFrame struct {
 	ID            string    `json:"id"`
+	RouteName     string    `json:"route_name"` // Proxy route name
 	ConnectionID  string    `json:"connection_id"`
 	Timestamp     time.Time `json:"timestamp"`
 	Type          string    `json:"type"`
@@ -175,6 +185,7 @@ type WebSocketFrame struct {
 // SSEEvent represents a Server-Sent Event
 type SSEEvent struct {
 	ID           string    `json:"id"`
+	RouteName    string    `json:"route_name"` // Proxy route name
 	ConnectionID string    `json:"connection_id"`
 	Timestamp    time.Time `json:"timestamp"`
 	Type         string    `json:"type"`
@@ -183,6 +194,20 @@ type SSEEvent struct {
 	IDField      string    `json:"id_field,omitempty"`
 	Retry        *int      `json:"retry,omitempty"`
 }
+
+// RoutedEntry interface for log entries that have a route name
+type RoutedEntry interface {
+	GetRouteName() string
+}
+
+// GetRouteName implements RoutedEntry for LogEntry
+func (e *LogEntry) GetRouteName() string { return e.RouteName }
+
+// GetRouteName implements RoutedEntry for WebSocketFrame
+func (e *WebSocketFrame) GetRouteName() string { return e.RouteName }
+
+// GetRouteName implements RoutedEntry for SSEEvent
+func (e *SSEEvent) GetRouteName() string { return e.RouteName }
 
 // LogWriter interface for different log outputs
 type LogWriter interface {
@@ -194,15 +219,14 @@ type LogWriter interface {
 
 // JSONLWriter writes entries to JSONL files
 type JSONLWriter struct {
-	mu           sync.Mutex
-	basePath     string
-	file         *os.File
-	size         int64
-	rotateSize   int64
-	retention    int
-	uploader     *S3Uploader
-	listenAddr   string
-	upstreamAddr string
+	mu         sync.Mutex
+	basePath   string
+	file       *os.File
+	size       int64
+	rotateSize int64
+	retention  int
+	uploader   *S3Uploader
+	routeName  string // Used in rotated filenames
 }
 
 // SQLiteWriter writes entries to SQLite database
@@ -214,8 +238,7 @@ type SQLiteWriter struct {
 	rotateSize    int64
 	retention     int
 	uploader      *S3Uploader
-	listenAddr    string
-	upstreamAddr  string
+	routeName     string // Used in rotated filenames
 	stmtHTTP      *sql.Stmt
 	stmtWebSocket *sql.Stmt
 	stmtSSE       *sql.Stmt
@@ -244,6 +267,7 @@ type TapTransport struct {
 	logManager  *LogManager
 	maxBodySize int64
 	metrics     *ProxyMetrics
+	routeName   string
 	shouldLog   func(path string) bool
 }
 
@@ -251,96 +275,39 @@ type TapTransport struct {
 var cfg *Config
 
 // NewProxy creates a new proxy instance with the given configuration
-func NewProxy(c *Config) (*Proxy, error) {
-	// Validate configuration
-	if c.Upstream == "" {
-		return nil, errors.New("upstream URL is required")
-	}
-
-	if c.LogJSONL == "" && c.LogSQLite == "" {
-		return nil, errors.New("at least one of log-jsonl or log-sqlite is required")
-	}
-
-	if c.ListenHTTP == "" && c.ListenHTTPS == "" {
-		c.ListenHTTP = ":8080"
-	}
-
-	if c.MaxBodySize == 0 {
-		c.MaxBodySize = 100 * 1024 * 1024 // Default 100MB
-	}
-
-	// Set defaults for health/metrics paths
-	if c.HealthPath == "" {
-		c.HealthPath = "/_health"
-	}
-	if c.MetricsPath == "" {
-		c.MetricsPath = "/_metrics"
-	}
-
-	// Compile path exclusion patterns
-	for _, pattern := range c.ExcludePathsRegex {
+func NewProxy(pc *ProxyConfig, globalCfg *Config, logManager *LogManager) (*Proxy, error) {
+	// Compile path exclusion patterns for this proxy
+	for _, pattern := range pc.ExcludePathsRegex {
 		re, err := regexp.Compile(pattern)
 		if err != nil {
-			return nil, fmt.Errorf("invalid exclude pattern %q: %w", pattern, err)
+			return nil, fmt.Errorf("proxy %q: invalid exclude pattern %q: %w", pc.Name, pattern, err)
 		}
-		c.excludePatterns = append(c.excludePatterns, re)
+		pc.excludePatterns = append(pc.excludePatterns, re)
 	}
-	for _, pattern := range c.IncludePathsRegex {
+	for _, pattern := range pc.IncludePathsRegex {
 		re, err := regexp.Compile(pattern)
 		if err != nil {
-			return nil, fmt.Errorf("invalid include pattern %q: %w", pattern, err)
+			return nil, fmt.Errorf("proxy %q: invalid include pattern %q: %w", pc.Name, pattern, err)
 		}
-		c.includePatterns = append(c.includePatterns, re)
+		pc.includePatterns = append(pc.includePatterns, re)
 	}
 
 	// Parse upstream URL
-	upstreamURL, err := url.Parse(c.Upstream)
+	upstreamURL, err := url.Parse(pc.Upstream)
 	if err != nil {
-		return nil, fmt.Errorf("invalid upstream URL: %w", err)
-	}
-
-	// Initialize S3 uploader if configured
-	var s3Uploader *S3Uploader
-	if c.S3Bucket != "" {
-		s3Uploader, err = newS3Uploader(c.S3Bucket, c.S3Prefix, c.S3Endpoint)
-		if err != nil {
-			log.Printf("WARNING: S3 upload disabled: %v", err)
-		}
-	}
-
-	// Initialize log writers
-	var writers []LogWriter
-
-	listenAddr := c.ListenHTTP
-	if listenAddr == "" {
-		listenAddr = c.ListenHTTPS
-	}
-	upstreamAddr := sanitizeFilename(upstreamURL.Host)
-
-	if c.LogJSONL != "" {
-		jsonlWriter, err := newJSONLWriter(c.LogJSONL, c.RotateSize, c.Retention, s3Uploader, listenAddr, upstreamAddr)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create JSONL writer: %w", err)
-		}
-		writers = append(writers, jsonlWriter)
-	}
-
-	if c.LogSQLite != "" {
-		sqliteWriter, err := newSQLiteWriter(c.LogSQLite, c.RotateSize, c.Retention, s3Uploader, listenAddr, upstreamAddr)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create SQLite writer: %w", err)
-		}
-		writers = append(writers, sqliteWriter)
+		return nil, fmt.Errorf("proxy %q: invalid upstream URL: %w", pc.Name, err)
 	}
 
 	p := &Proxy{
-		cfg:         c,
+		name:        pc.Name,
+		proxyCfg:    pc,
+		globalCfg:   globalCfg,
 		upstreamURL: upstreamURL,
-		logManager:  newLogManager(writers, c.RotateInterval),
+		logManager:  logManager,
 		metrics:     &ProxyMetrics{startTime: time.Now()},
 		sseClient: &http.Client{
 			Transport: &http.Transport{
-				TLSClientConfig:     &tls.Config{InsecureSkipVerify: c.InsecureSkipVerify},
+				TLSClientConfig:     &tls.Config{InsecureSkipVerify: globalCfg.InsecureSkipVerify},
 				MaxIdleConns:        100,
 				MaxIdleConnsPerHost: 10,
 				IdleConnTimeout:     90 * time.Second,
@@ -373,21 +340,13 @@ func NewProxy(c *Config) (*Proxy, error) {
 	return p, nil
 }
 
-// createAdminHandler creates the handler for the admin endpoint (health/metrics)
-func (p *Proxy) createAdminHandler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc(p.cfg.HealthPath, p.handleHealthCheck)
-	mux.HandleFunc(p.cfg.MetricsPath, p.handleMetrics)
-	return mux
-}
-
 // shouldLogPath returns true if the path should be logged based on include/exclude patterns
 // Note: Our own health/metrics endpoints are handled before the proxy and never reach here
 func (p *Proxy) shouldLogPath(path string) bool {
 	// If include patterns are set, path must match at least one
-	if len(p.cfg.includePatterns) > 0 {
+	if len(p.proxyCfg.includePatterns) > 0 {
 		matched := false
-		for _, re := range p.cfg.includePatterns {
+		for _, re := range p.proxyCfg.includePatterns {
 			if re.MatchString(path) {
 				matched = true
 				break
@@ -399,7 +358,7 @@ func (p *Proxy) shouldLogPath(path string) bool {
 	}
 
 	// Check exclude patterns
-	for _, re := range p.cfg.excludePatterns {
+	for _, re := range p.proxyCfg.excludePatterns {
 		if re.MatchString(path) {
 			return false
 		}
@@ -408,121 +367,42 @@ func (p *Proxy) shouldLogPath(path string) bool {
 	return true
 }
 
-// handleHealthCheck responds to health check requests
-func (p *Proxy) handleHealthCheck(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	resp := map[string]any{
-		"status":  "healthy",
-		"version": Version,
-		"uptime":  time.Since(p.metrics.startTime).String(),
-	}
-	_ = json.NewEncoder(w).Encode(resp)
-}
-
-// handleMetrics responds with Prometheus-compatible metrics
-func (p *Proxy) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-
-	uptimeSeconds := time.Since(p.metrics.startTime).Seconds()
-	avgLatencyUs := float64(0)
-	if cnt := p.metrics.UpstreamLatencyCnt.Load(); cnt > 0 {
-		avgLatencyUs = float64(p.metrics.UpstreamLatencySum.Load()) / float64(cnt)
-	}
-
-	_, _ = fmt.Fprintf(w, "# HELP http_tap_proxy_requests_total Total number of HTTP requests\n")
-	_, _ = fmt.Fprintf(w, "# TYPE http_tap_proxy_requests_total counter\n")
-	_, _ = fmt.Fprintf(w, "http_tap_proxy_requests_total %d\n", p.metrics.RequestsTotal.Load())
-
-	_, _ = fmt.Fprintf(w, "# HELP http_tap_proxy_requests_active Current number of active requests\n")
-	_, _ = fmt.Fprintf(w, "# TYPE http_tap_proxy_requests_active gauge\n")
-	_, _ = fmt.Fprintf(w, "http_tap_proxy_requests_active %d\n", p.metrics.RequestsActive.Load())
-
-	_, _ = fmt.Fprintf(w, "# HELP http_tap_proxy_bytes_received_total Total bytes received from clients\n")
-	_, _ = fmt.Fprintf(w, "# TYPE http_tap_proxy_bytes_received_total counter\n")
-	_, _ = fmt.Fprintf(w, "http_tap_proxy_bytes_received_total %d\n", p.metrics.BytesReceived.Load())
-
-	_, _ = fmt.Fprintf(w, "# HELP http_tap_proxy_bytes_sent_total Total bytes sent to clients\n")
-	_, _ = fmt.Fprintf(w, "# TYPE http_tap_proxy_bytes_sent_total counter\n")
-	_, _ = fmt.Fprintf(w, "http_tap_proxy_bytes_sent_total %d\n", p.metrics.BytesSent.Load())
-
-	_, _ = fmt.Fprintf(w, "# HELP http_tap_proxy_errors_total Total number of proxy errors\n")
-	_, _ = fmt.Fprintf(w, "# TYPE http_tap_proxy_errors_total counter\n")
-	_, _ = fmt.Fprintf(w, "http_tap_proxy_errors_total %d\n", p.metrics.ErrorsTotal.Load())
-
-	_, _ = fmt.Fprintf(w, "# HELP http_tap_proxy_websocket_connections_active Active WebSocket connections\n")
-	_, _ = fmt.Fprintf(w, "# TYPE http_tap_proxy_websocket_connections_active gauge\n")
-	_, _ = fmt.Fprintf(w, "http_tap_proxy_websocket_connections_active %d\n", p.metrics.WebSocketConns.Load())
-
-	_, _ = fmt.Fprintf(w, "# HELP http_tap_proxy_sse_connections_active Active SSE connections\n")
-	_, _ = fmt.Fprintf(w, "# TYPE http_tap_proxy_sse_connections_active gauge\n")
-	_, _ = fmt.Fprintf(w, "http_tap_proxy_sse_connections_active %d\n", p.metrics.SSEConns.Load())
-
-	_, _ = fmt.Fprintf(w, "# HELP http_tap_proxy_upstream_latency_avg_microseconds Average upstream latency in microseconds\n")
-	_, _ = fmt.Fprintf(w, "# TYPE http_tap_proxy_upstream_latency_avg_microseconds gauge\n")
-	_, _ = fmt.Fprintf(w, "http_tap_proxy_upstream_latency_avg_microseconds %.2f\n", avgLatencyUs)
-
-	_, _ = fmt.Fprintf(w, "# HELP http_tap_proxy_log_errors_total Total number of logging errors\n")
-	_, _ = fmt.Fprintf(w, "# TYPE http_tap_proxy_log_errors_total counter\n")
-	_, _ = fmt.Fprintf(w, "http_tap_proxy_log_errors_total %d\n", p.metrics.LogErrorsTotal.Load())
-
-	_, _ = fmt.Fprintf(w, "# HELP http_tap_proxy_uptime_seconds Proxy uptime in seconds\n")
-	_, _ = fmt.Fprintf(w, "# TYPE http_tap_proxy_uptime_seconds gauge\n")
-	_, _ = fmt.Fprintf(w, "http_tap_proxy_uptime_seconds %.2f\n", uptimeSeconds)
-}
-
 // Start begins listening on configured addresses. Returns when servers are ready.
 func (p *Proxy) Start() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if p.cfg.ListenHTTP != "" {
-		listener, err := net.Listen("tcp", p.cfg.ListenHTTP)
+	if p.proxyCfg.ListenHTTP != "" {
+		listener, err := net.Listen("tcp", p.proxyCfg.ListenHTTP)
 		if err != nil {
-			return fmt.Errorf("failed to listen on %s: %w", p.cfg.ListenHTTP, err)
+			return fmt.Errorf("proxy %q: failed to listen on %s: %w", p.name, p.proxyCfg.ListenHTTP, err)
 		}
 		p.httpListener = listener
 		p.httpServer = &http.Server{Handler: p.handler}
 
 		p.wg.Go(func() {
 			if err := p.httpServer.Serve(listener); err != http.ErrServerClosed {
-				log.Printf("HTTP server error: %v", err)
+				log.Printf("proxy %q: HTTP server error: %v", p.name, err)
 			}
 		})
 	}
 
-	if p.cfg.ListenHTTPS != "" {
+	if p.proxyCfg.ListenHTTPS != "" {
 		tlsConfig, err := p.getTLSConfig()
 		if err != nil {
 			return err
 		}
 
-		listener, err := tls.Listen("tcp", p.cfg.ListenHTTPS, tlsConfig)
+		listener, err := tls.Listen("tcp", p.proxyCfg.ListenHTTPS, tlsConfig)
 		if err != nil {
-			return fmt.Errorf("failed to listen on %s: %w", p.cfg.ListenHTTPS, err)
+			return fmt.Errorf("proxy %q: failed to listen on %s: %w", p.name, p.proxyCfg.ListenHTTPS, err)
 		}
 		p.httpsListener = listener
 		p.httpsServer = &http.Server{Handler: p.handler, TLSConfig: tlsConfig}
 
 		p.wg.Go(func() {
 			if err := p.httpsServer.Serve(listener); err != http.ErrServerClosed {
-				log.Printf("HTTPS server error: %v", err)
-			}
-		})
-	}
-
-	// Start admin server for health/metrics if configured
-	if p.cfg.ListenAdmin != "" {
-		listener, err := net.Listen("tcp", p.cfg.ListenAdmin)
-		if err != nil {
-			return fmt.Errorf("failed to listen on admin port %s: %w", p.cfg.ListenAdmin, err)
-		}
-		p.adminListener = listener
-		p.adminServer = &http.Server{Handler: p.createAdminHandler()}
-
-		p.wg.Go(func() {
-			if err := p.adminServer.Serve(listener); err != http.ErrServerClosed {
-				log.Printf("Admin server error: %v", err)
+				log.Printf("proxy %q: HTTPS server error: %v", p.name, err)
 			}
 		})
 	}
@@ -550,17 +430,7 @@ func (p *Proxy) HTTPSAddr() string {
 	return ""
 }
 
-// AdminAddr returns the actual admin listen address
-func (p *Proxy) AdminAddr() string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.adminListener != nil {
-		return p.adminListener.Addr().String()
-	}
-	return ""
-}
-
-// Close gracefully shuts down the proxy
+// Close gracefully shuts down the proxy (does not stop logManager - that's shared)
 func (p *Proxy) Close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -574,18 +444,13 @@ func (p *Proxy) Close() error {
 	if p.httpsServer != nil {
 		_ = p.httpsServer.Shutdown(ctx)
 	}
-	if p.adminServer != nil {
-		_ = p.adminServer.Shutdown(ctx)
-	}
 
 	p.wg.Wait()
-	p.logManager.Stop()
-
 	return nil
 }
 
 func (p *Proxy) getTLSConfig() (*tls.Config, error) {
-	if p.cfg.AutoCert {
+	if p.globalCfg.AutoCert {
 		cert, err := generateSelfSignedCert()
 		if err != nil {
 			return nil, fmt.Errorf("failed to generate self-signed cert: %w", err)
@@ -593,8 +458,8 @@ func (p *Proxy) getTLSConfig() (*tls.Config, error) {
 		return &tls.Config{Certificates: []tls.Certificate{cert}}, nil
 	}
 
-	if p.cfg.CertFile != "" && p.cfg.KeyFile != "" {
-		cert, err := tls.LoadX509KeyPair(p.cfg.CertFile, p.cfg.KeyFile)
+	if p.globalCfg.CertFile != "" && p.globalCfg.KeyFile != "" {
+		cert, err := tls.LoadX509KeyPair(p.globalCfg.CertFile, p.globalCfg.KeyFile)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
 		}
@@ -602,6 +467,230 @@ func (p *Proxy) getTLSConfig() (*tls.Config, error) {
 	}
 
 	return nil, errors.New("HTTPS requires either --auto-cert or both --cert and --key")
+}
+
+// initProxies initializes and starts all proxy instances.
+// Returns the proxies and log manager, or an error.
+func initProxies(c *Config) ([]*Proxy, *LogManager, error) {
+	// Set defaults
+	if c.MaxBodySize == 0 {
+		c.MaxBodySize = 100 * 1024 * 1024
+	}
+	if c.HealthPath == "" {
+		c.HealthPath = "/_health"
+	}
+	if c.MetricsPath == "" {
+		c.MetricsPath = "/_metrics"
+	}
+
+	// Initialize S3 uploader if configured
+	var s3Uploader *S3Uploader
+	if c.S3Bucket != "" {
+		var err error
+		s3Uploader, err = newS3Uploader(c.S3Bucket, c.S3Prefix, c.S3Endpoint)
+		if err != nil {
+			log.Printf("WARNING: S3 upload disabled: %v", err)
+		}
+	}
+
+	// Create log writers
+	// writerCache deduplicates writers by path - shared paths get empty routeName
+	var writers []LogWriter
+	writerCache := make(map[string]LogWriter)
+
+	// Helper to close all writers on error (before logManager is created)
+	closeWriters := func() {
+		for _, w := range writers {
+			_ = w.Close()
+		}
+	}
+
+	// Determine if global paths are shared (same file for all proxies)
+	// Shared mode: path doesn't end with / and isn't an existing directory
+	isSharedPath := func(globalPath string) bool {
+		if globalPath == "" {
+			return false
+		}
+		if strings.HasSuffix(globalPath, "/") || strings.HasSuffix(globalPath, string(filepath.Separator)) {
+			return false // Directory mode - per-proxy files
+		}
+		info, err := os.Stat(globalPath)
+		if err == nil && info.IsDir() {
+			return false // Existing directory - per-proxy files
+		}
+		return true // File mode - shared
+	}
+
+	jsonlShared := isSharedPath(c.LogJSONL)
+	sqliteShared := isSharedPath(c.LogSQLite)
+
+	for i := range c.Proxies {
+		pc := &c.Proxies[i]
+
+		jsonlPath := pc.LogJSONL
+		if jsonlPath == "" {
+			jsonlPath = resolveLogPath(c.LogJSONL, pc.Name, ".jsonl")
+		}
+		if jsonlPath != "" {
+			if _, ok := writerCache[jsonlPath]; !ok {
+				// Use empty routeName for shared files to disable filtering
+				// routeName is used for: 1) filtering entries, 2) rotated filenames
+				routeName := pc.Name
+				if jsonlShared && pc.LogJSONL == "" {
+					routeName = "" // Shared global file - don't filter by route
+				}
+				w, err := newJSONLWriter(jsonlPath, c.RotateSize, c.Retention, s3Uploader, routeName)
+				if err != nil {
+					closeWriters()
+					return nil, nil, fmt.Errorf("failed to create JSONL writer for proxy %q: %w", pc.Name, err)
+				}
+				writers = append(writers, w)
+				writerCache[jsonlPath] = w
+			}
+		}
+
+		sqlitePath := pc.LogSQLite
+		if sqlitePath == "" {
+			sqlitePath = resolveLogPath(c.LogSQLite, pc.Name, ".db")
+		}
+		if sqlitePath != "" {
+			if _, ok := writerCache[sqlitePath]; !ok {
+				// Use empty routeName for shared files to disable filtering
+				routeName := pc.Name
+				if sqliteShared && pc.LogSQLite == "" {
+					routeName = "" // Shared global file - don't filter by route
+				}
+				w, err := newSQLiteWriter(sqlitePath, c.RotateSize, c.Retention, s3Uploader, routeName)
+				if err != nil {
+					closeWriters()
+					return nil, nil, fmt.Errorf("failed to create SQLite writer for proxy %q: %w", pc.Name, err)
+				}
+				writers = append(writers, w)
+				writerCache[sqlitePath] = w
+			}
+		}
+	}
+
+	if len(writers) == 0 {
+		return nil, nil, errors.New("no log writers configured")
+	}
+
+	logManager := newLogManager(writers, c.RotateInterval)
+
+	// Helper to close already-started proxies on error
+	closeProxies := func(proxies []*Proxy) {
+		for _, p := range proxies {
+			_ = p.Close()
+		}
+	}
+
+	var proxies []*Proxy
+	for i := range c.Proxies {
+		pc := &c.Proxies[i]
+		proxy, err := NewProxy(pc, c, logManager)
+		if err != nil {
+			closeProxies(proxies)
+			logManager.Stop()
+			return nil, nil, fmt.Errorf("failed to create proxy %q: %w", pc.Name, err)
+		}
+		proxies = append(proxies, proxy)
+
+		if err := proxy.Start(); err != nil {
+			closeProxies(proxies)
+			logManager.Stop()
+			return nil, nil, fmt.Errorf("failed to start proxy %q: %w", pc.Name, err)
+		}
+	}
+
+	return proxies, logManager, nil
+}
+
+// createAdminHandler creates the HTTP handler for admin endpoints (health/metrics).
+// This is shared between main() and Windows service.
+func createAdminHandler(proxies []*Proxy, startTime time.Time, c *Config) http.Handler {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc(c.HealthPath, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		resp := map[string]any{
+			"status":  "healthy",
+			"version": Version,
+			"uptime":  time.Since(startTime).String(),
+			"proxies": len(proxies),
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+
+	mux.HandleFunc(c.MetricsPath, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+
+		// Per-route metrics with labels
+		_, _ = fmt.Fprintf(w, "# HELP http_tap_proxy_requests_total Total number of HTTP requests\n")
+		_, _ = fmt.Fprintf(w, "# TYPE http_tap_proxy_requests_total counter\n")
+		for _, p := range proxies {
+			_, _ = fmt.Fprintf(w, "http_tap_proxy_requests_total{route=\"%s\"} %d\n", p.name, p.metrics.RequestsTotal.Load())
+		}
+
+		_, _ = fmt.Fprintf(w, "# HELP http_tap_proxy_requests_active Current number of active requests\n")
+		_, _ = fmt.Fprintf(w, "# TYPE http_tap_proxy_requests_active gauge\n")
+		for _, p := range proxies {
+			_, _ = fmt.Fprintf(w, "http_tap_proxy_requests_active{route=\"%s\"} %d\n", p.name, p.metrics.RequestsActive.Load())
+		}
+
+		_, _ = fmt.Fprintf(w, "# HELP http_tap_proxy_bytes_received_total Total bytes received\n")
+		_, _ = fmt.Fprintf(w, "# TYPE http_tap_proxy_bytes_received_total counter\n")
+		for _, p := range proxies {
+			_, _ = fmt.Fprintf(w, "http_tap_proxy_bytes_received_total{route=\"%s\"} %d\n", p.name, p.metrics.BytesReceived.Load())
+		}
+
+		_, _ = fmt.Fprintf(w, "# HELP http_tap_proxy_bytes_sent_total Total bytes sent\n")
+		_, _ = fmt.Fprintf(w, "# TYPE http_tap_proxy_bytes_sent_total counter\n")
+		for _, p := range proxies {
+			_, _ = fmt.Fprintf(w, "http_tap_proxy_bytes_sent_total{route=\"%s\"} %d\n", p.name, p.metrics.BytesSent.Load())
+		}
+
+		_, _ = fmt.Fprintf(w, "# HELP http_tap_proxy_errors_total Total proxy errors\n")
+		_, _ = fmt.Fprintf(w, "# TYPE http_tap_proxy_errors_total counter\n")
+		for _, p := range proxies {
+			_, _ = fmt.Fprintf(w, "http_tap_proxy_errors_total{route=\"%s\"} %d\n", p.name, p.metrics.ErrorsTotal.Load())
+		}
+
+		_, _ = fmt.Fprintf(w, "# HELP http_tap_proxy_websocket_connections_active Active WebSocket connections\n")
+		_, _ = fmt.Fprintf(w, "# TYPE http_tap_proxy_websocket_connections_active gauge\n")
+		for _, p := range proxies {
+			_, _ = fmt.Fprintf(w, "http_tap_proxy_websocket_connections_active{route=\"%s\"} %d\n", p.name, p.metrics.WebSocketConns.Load())
+		}
+
+		_, _ = fmt.Fprintf(w, "# HELP http_tap_proxy_sse_connections_active Active SSE connections\n")
+		_, _ = fmt.Fprintf(w, "# TYPE http_tap_proxy_sse_connections_active gauge\n")
+		for _, p := range proxies {
+			_, _ = fmt.Fprintf(w, "http_tap_proxy_sse_connections_active{route=\"%s\"} %d\n", p.name, p.metrics.SSEConns.Load())
+		}
+
+		_, _ = fmt.Fprintf(w, "# HELP http_tap_proxy_upstream_latency_avg_microseconds Average upstream latency\n")
+		_, _ = fmt.Fprintf(w, "# TYPE http_tap_proxy_upstream_latency_avg_microseconds gauge\n")
+		for _, p := range proxies {
+			avgLatencyUs := float64(0)
+			latencyCnt := p.metrics.UpstreamLatencyCnt.Load()
+			if latencyCnt > 0 {
+				avgLatencyUs = float64(p.metrics.UpstreamLatencySum.Load()) / float64(latencyCnt)
+			}
+			_, _ = fmt.Fprintf(w, "http_tap_proxy_upstream_latency_avg_microseconds{route=\"%s\"} %.2f\n", p.name, avgLatencyUs)
+		}
+
+		_, _ = fmt.Fprintf(w, "# HELP http_tap_proxy_log_errors_total Total logging errors\n")
+		_, _ = fmt.Fprintf(w, "# TYPE http_tap_proxy_log_errors_total counter\n")
+		for _, p := range proxies {
+			_, _ = fmt.Fprintf(w, "http_tap_proxy_log_errors_total{route=\"%s\"} %d\n", p.name, p.metrics.LogErrorsTotal.Load())
+		}
+
+		_, _ = fmt.Fprintf(w, "# HELP http_tap_proxy_uptime_seconds Process uptime in seconds\n")
+		_, _ = fmt.Fprintf(w, "# TYPE http_tap_proxy_uptime_seconds gauge\n")
+		_, _ = fmt.Fprintf(w, "http_tap_proxy_uptime_seconds %.2f\n", time.Since(startTime).Seconds())
+	})
+
+	return mux
 }
 
 func main() {
@@ -618,26 +707,45 @@ func main() {
 		return
 	}
 
-	// Create and start proxy
-	proxy, err := NewProxy(cfg)
+	proxies, logManager, err := initProxies(cfg)
 	if err != nil {
-		log.Fatalf("failed to create proxy: %v", err)
+		log.Fatalf("%v", err)
 	}
 
-	if err := proxy.Start(); err != nil {
-		log.Fatalf("failed to start proxy: %v", err)
-	}
+	// Track process start time for uptime metric
+	startTime := time.Now()
 
-	log.Printf("HTTP Tap Proxy v%s started", Version)
-	log.Printf("Upstream: %s", cfg.Upstream)
-	if cfg.ListenHTTP != "" {
-		log.Printf("Listening HTTP: %s", proxy.HTTPAddr())
-	}
-	if cfg.ListenHTTPS != "" {
-		log.Printf("Listening HTTPS: %s", proxy.HTTPSAddr())
-	}
+	// Start admin server if configured
+	var adminServer *http.Server
+	var adminListener net.Listener
 	if cfg.ListenAdmin != "" {
-		log.Printf("Admin (health/metrics): %s", proxy.AdminAddr())
+		var err error
+		adminListener, err = net.Listen("tcp", cfg.ListenAdmin)
+		if err != nil {
+			log.Fatalf("failed to listen on admin port %s: %v", cfg.ListenAdmin, err)
+		}
+
+		adminServer = &http.Server{Handler: createAdminHandler(proxies, startTime, cfg)}
+		go func() {
+			if err := adminServer.Serve(adminListener); err != http.ErrServerClosed {
+				log.Printf("Admin server error: %v", err)
+			}
+		}()
+	}
+
+	// Print startup info
+	log.Printf("HTTP Tap Proxy v%s started", Version)
+	for _, p := range proxies {
+		log.Printf("Proxy %q: upstream=%s", p.name, p.proxyCfg.Upstream)
+		if p.proxyCfg.ListenHTTP != "" {
+			log.Printf("  HTTP: %s", p.HTTPAddr())
+		}
+		if p.proxyCfg.ListenHTTPS != "" {
+			log.Printf("  HTTPS: %s", p.HTTPSAddr())
+		}
+	}
+	if cfg.ListenAdmin != "" && adminListener != nil {
+		log.Printf("Admin (health/metrics): %s", adminListener.Addr().String())
 	}
 
 	// Wait for shutdown signal
@@ -646,7 +754,22 @@ func main() {
 	<-sigChan
 
 	log.Println("Shutting down...")
-	_ = proxy.Close()
+
+	// Shutdown admin server
+	if adminServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = adminServer.Shutdown(ctx)
+		cancel()
+	}
+
+	// Shutdown all proxies
+	for _, p := range proxies {
+		_ = p.Close()
+	}
+
+	// Stop log manager
+	logManager.Stop()
+
 	log.Println("Shutdown complete")
 }
 
@@ -662,15 +785,83 @@ func (m *multiStringFlag) Set(value string) error {
 	return nil
 }
 
+// proxyFlag collects multiple --proxy flag values
+type proxyFlag []string
+
+func (p *proxyFlag) String() string {
+	return strings.Join(*p, " ")
+}
+
+func (p *proxyFlag) Set(value string) error {
+	*p = append(*p, value)
+	return nil
+}
+
+// parseProxyFlag parses a --proxy flag value in key=value format
+// Format: name=xxx,listen_http=:8080,listen_https=:8443,upstream=http://...,log_jsonl=...,log_sqlite=...
+func parseProxyFlag(value string) (*ProxyConfig, error) {
+	pc := &ProxyConfig{}
+	parts := strings.Split(value, ",")
+
+	for _, part := range parts {
+		k, v, ok := strings.Cut(part, "=")
+		if !ok {
+			return nil, fmt.Errorf("invalid proxy config part %q (expected key=value)", part)
+		}
+		k = strings.TrimSpace(k)
+		v = strings.TrimSpace(v)
+
+		switch k {
+		case "name":
+			// Validate name for Prometheus label safety and filename safety
+			if matched, _ := regexp.MatchString(`^[a-zA-Z][a-zA-Z0-9_-]*$`, v); !matched {
+				return nil, fmt.Errorf("proxy name %q is invalid (must start with letter, only alphanumeric/underscore/hyphen allowed)", v)
+			}
+			pc.Name = v
+		case "listen_http":
+			pc.ListenHTTP = v
+		case "listen_https":
+			pc.ListenHTTPS = v
+		case "upstream":
+			pc.Upstream = v
+		case "log_jsonl":
+			pc.LogJSONL = v
+		case "log_sqlite":
+			pc.LogSQLite = v
+		case "exclude_path":
+			pc.ExcludePathsRegex = append(pc.ExcludePathsRegex, v)
+		case "include_path":
+			pc.IncludePathsRegex = append(pc.IncludePathsRegex, v)
+		default:
+			return nil, fmt.Errorf("unknown proxy config key %q", k)
+		}
+	}
+
+	// Validate required fields
+	if pc.Name == "" {
+		return nil, fmt.Errorf("proxy config missing required 'name' field")
+	}
+	if pc.Upstream == "" {
+		return nil, fmt.Errorf("proxy config %q missing required 'upstream' field", pc.Name)
+	}
+	if pc.ListenHTTP == "" && pc.ListenHTTPS == "" {
+		return nil, fmt.Errorf("proxy config %q must have at least one of 'listen_http' or 'listen_https'", pc.Name)
+	}
+
+	return pc, nil
+}
+
 func parseFlags() *Config {
 	cfg := &Config{}
 
-	flag.StringVar(&cfg.ListenHTTP, "listen-http", "", "HTTP listen address (e.g., :8080)")
-	flag.StringVar(&cfg.ListenHTTPS, "listen-https", "", "HTTPS listen address (e.g., :8443)")
+	// Proxy definitions (can be specified multiple times)
+	var proxies proxyFlag
+	flag.Var(&proxies, "proxy", "Proxy config: name=xxx,listen_http=:8080,upstream=http://... (can be repeated)")
+
+	// Global settings
 	flag.StringVar(&cfg.ListenAdmin, "listen-admin", "", "Admin listen address for health/metrics (e.g., :9090)")
-	flag.StringVar(&cfg.Upstream, "upstream", "", "Upstream URL (e.g., http://localhost:5000/api/)")
-	flag.StringVar(&cfg.LogJSONL, "log-jsonl", "", "Path for JSONL log file")
-	flag.StringVar(&cfg.LogSQLite, "log-sqlite", "", "Path for SQLite log database")
+	flag.StringVar(&cfg.LogJSONL, "log-jsonl", "", "Global JSONL log path (directory for per-proxy files, or file for shared)")
+	flag.StringVar(&cfg.LogSQLite, "log-sqlite", "", "Global SQLite log path (directory for per-proxy files, or file for shared)")
 
 	var rotateSizeStr string
 	flag.StringVar(&rotateSizeStr, "rotate-size", "100MB", "Rotate logs when size exceeds (e.g., 100MB, 1GB)")
@@ -698,16 +889,68 @@ func parseFlags() *Config {
 	flag.StringVar(&cfg.HealthPath, "health-path", "/_health", "Path for health check endpoint")
 	flag.StringVar(&cfg.MetricsPath, "metrics-path", "/_metrics", "Path for Prometheus metrics endpoint")
 
-	// Path exclusion/inclusion
-	var excludePaths multiStringFlag
-	var includePaths multiStringFlag
-	flag.Var(&excludePaths, "exclude-path", "Regex pattern for paths to exclude from logging (can be specified multiple times)")
-	flag.Var(&includePaths, "include-path", "Regex pattern for paths to include in logging; if set, only matching paths are logged (can be specified multiple times)")
-
 	flag.Parse()
 
-	cfg.ExcludePathsRegex = excludePaths
-	cfg.IncludePathsRegex = includePaths
+	// Parse proxy definitions
+	for _, p := range proxies {
+		pc, err := parseProxyFlag(p)
+		if err != nil {
+			log.Fatalf("invalid --proxy flag: %v", err)
+		}
+		cfg.Proxies = append(cfg.Proxies, *pc)
+	}
+
+	// Validate we have at least one proxy
+	if len(cfg.Proxies) == 0 && cfg.ServiceCmd == "" && !cfg.PrintSystemd {
+		log.Fatalf("at least one --proxy is required")
+	}
+
+	// Validate proxy count limit
+	const maxProxies = 10
+	if len(cfg.Proxies) > maxProxies {
+		log.Fatalf("too many proxies: %d (maximum is %d)", len(cfg.Proxies), maxProxies)
+	}
+
+	// Validate no duplicate proxy names
+	seenNames := make(map[string]bool)
+	for _, p := range cfg.Proxies {
+		if seenNames[p.Name] {
+			log.Fatalf("duplicate proxy name: %q", p.Name)
+		}
+		seenNames[p.Name] = true
+	}
+
+	// Validate no duplicate listen addresses (port conflicts)
+	seenAddrs := make(map[string]string) // addr -> proxy name
+	for _, p := range cfg.Proxies {
+		if p.ListenHTTP != "" {
+			if existing, ok := seenAddrs[p.ListenHTTP]; ok {
+				log.Fatalf("port conflict: proxy %q and %q both listen on %s", existing, p.Name, p.ListenHTTP)
+			}
+			seenAddrs[p.ListenHTTP] = p.Name
+		}
+		if p.ListenHTTPS != "" {
+			if existing, ok := seenAddrs[p.ListenHTTPS]; ok {
+				log.Fatalf("port conflict: proxy %q and %q both listen on %s", existing, p.Name, p.ListenHTTPS)
+			}
+			seenAddrs[p.ListenHTTPS] = p.Name
+		}
+	}
+
+	// Validate we have at least one log destination
+	if cfg.LogJSONL == "" && cfg.LogSQLite == "" && cfg.ServiceCmd == "" && !cfg.PrintSystemd {
+		// Check if any proxy has per-proxy log config
+		hasLogConfig := false
+		for _, p := range cfg.Proxies {
+			if p.LogJSONL != "" || p.LogSQLite != "" {
+				hasLogConfig = true
+				break
+			}
+		}
+		if !hasLogConfig {
+			log.Fatalf("at least one of --log-jsonl or --log-sqlite is required (global or per-proxy)")
+		}
+	}
 
 	// Parse sizes
 	var err error
@@ -768,21 +1011,49 @@ func sanitizeFilename(s string) string {
 	return re.ReplaceAllString(s, "-")
 }
 
+// resolveLogPath determines the actual log path for a proxy.
+// If globalPath is a directory (ends with / or is an existing dir), returns {dir}/{routeName}.{ext}
+// Otherwise returns globalPath as-is (shared file mode)
+func resolveLogPath(globalPath, routeName, defaultExt string) string {
+	if globalPath == "" {
+		return ""
+	}
+
+	// Check if it's explicitly a directory (ends with /)
+	if strings.HasSuffix(globalPath, "/") || strings.HasSuffix(globalPath, string(filepath.Separator)) {
+		return filepath.Join(globalPath, routeName+defaultExt)
+	}
+
+	// Check if it's an existing directory
+	info, err := os.Stat(globalPath)
+	if err == nil && info.IsDir() {
+		return filepath.Join(globalPath, routeName+defaultExt)
+	}
+
+	// Warn if path doesn't exist and has no extension (ambiguous: file or dir?)
+	// Only log in verbose mode to avoid cluttering production logs
+	if err != nil && filepath.Ext(globalPath) == "" && cfg != nil && cfg.Verbose {
+		log.Printf("WARNING: log path %q doesn't exist and has no extension - treating as file (use trailing / for directory)", globalPath)
+	}
+
+	// Otherwise treat as a file path (shared mode)
+	return globalPath
+}
+
 // ==================== JSONL Writer ====================
 
-func newJSONLWriter(basePath string, rotateSize int64, retention int, uploader *S3Uploader, listenAddr, upstreamAddr string) (*JSONLWriter, error) {
+func newJSONLWriter(basePath string, rotateSize int64, retention int, uploader *S3Uploader, routeName string) (*JSONLWriter, error) {
 	dir := filepath.Dir(basePath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create directory: %w", err)
 	}
 
 	w := &JSONLWriter{
-		basePath:     basePath,
-		rotateSize:   rotateSize,
-		retention:    retention,
-		uploader:     uploader,
-		listenAddr:   sanitizeFilename(listenAddr),
-		upstreamAddr: upstreamAddr,
+		basePath:   basePath,
+		rotateSize: rotateSize,
+		retention:  retention,
+		uploader:   uploader,
+		routeName:  routeName,
 	}
 
 	if err := w.openFile(); err != nil {
@@ -810,6 +1081,16 @@ func (w *JSONLWriter) openFile() error {
 }
 
 func (w *JSONLWriter) Write(entry any) error {
+	// Filter by route if this writer is route-specific.
+	// Empty routeName means "write all routes" (shared file mode).
+	if w.routeName != "" {
+		if re, ok := entry.(RoutedEntry); ok {
+			if re.GetRouteName() != w.routeName {
+				return nil // Skip entries for other routes
+			}
+		}
+	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -863,7 +1144,11 @@ func (w *JSONLWriter) rotateInternal() error {
 	timestamp := time.Now().Format("20060102_150405")
 	ext := filepath.Ext(w.basePath)
 	base := strings.TrimSuffix(w.basePath, ext)
-	rotatedPath := fmt.Sprintf("%s_%s_%s_%s%s", base, timestamp, w.listenAddr, w.upstreamAddr, ext)
+	name := w.routeName
+	if name == "" {
+		name = "shared" // Fallback for shared file mode
+	}
+	rotatedPath := fmt.Sprintf("%s_%s_%s%s", base, name, timestamp, ext)
 
 	// Rename current file
 	if err := os.Rename(w.basePath, rotatedPath); err != nil {
@@ -936,19 +1221,18 @@ func (w *JSONLWriter) Close() error {
 
 // ==================== SQLite Writer ====================
 
-func newSQLiteWriter(basePath string, rotateSize int64, retention int, uploader *S3Uploader, listenAddr, upstreamAddr string) (*SQLiteWriter, error) {
+func newSQLiteWriter(basePath string, rotateSize int64, retention int, uploader *S3Uploader, routeName string) (*SQLiteWriter, error) {
 	dir := filepath.Dir(basePath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create directory: %w", err)
 	}
 
 	w := &SQLiteWriter{
-		basePath:     basePath,
-		rotateSize:   rotateSize,
-		retention:    retention,
-		uploader:     uploader,
-		listenAddr:   sanitizeFilename(listenAddr),
-		upstreamAddr: upstreamAddr,
+		basePath:   basePath,
+		rotateSize: rotateSize,
+		retention:  retention,
+		uploader:   uploader,
+		routeName:  routeName,
 	}
 
 	if err := w.openDB(); err != nil {
@@ -969,6 +1253,7 @@ func (w *SQLiteWriter) openDB() error {
 		-- HTTP request/response entries
 		CREATE TABLE IF NOT EXISTS http_entries (
 			id TEXT PRIMARY KEY,
+			route_name TEXT NOT NULL,
 			timestamp TEXT NOT NULL,
 			duration_ms INTEGER,
 			client_ip TEXT,
@@ -1019,6 +1304,7 @@ func (w *SQLiteWriter) openDB() error {
 			resp_x_request_id TEXT
 		);
 		CREATE INDEX IF NOT EXISTS idx_http_timestamp ON http_entries(timestamp);
+		CREATE INDEX IF NOT EXISTS idx_http_route ON http_entries(route_name);
 		CREATE INDEX IF NOT EXISTS idx_http_method ON http_entries(req_method);
 		CREATE INDEX IF NOT EXISTS idx_http_status ON http_entries(resp_status);
 		CREATE INDEX IF NOT EXISTS idx_http_url ON http_entries(req_url);
@@ -1027,6 +1313,7 @@ func (w *SQLiteWriter) openDB() error {
 		-- WebSocket frame entries
 		CREATE TABLE IF NOT EXISTS websocket_frames (
 			id TEXT PRIMARY KEY,
+			route_name TEXT NOT NULL,
 			connection_id TEXT NOT NULL,
 			timestamp TEXT NOT NULL,
 			direction TEXT,
@@ -1038,12 +1325,14 @@ func (w *SQLiteWriter) openDB() error {
 			payload_size INTEGER
 		);
 		CREATE INDEX IF NOT EXISTS idx_ws_timestamp ON websocket_frames(timestamp);
+		CREATE INDEX IF NOT EXISTS idx_ws_route ON websocket_frames(route_name);
 		CREATE INDEX IF NOT EXISTS idx_ws_connection ON websocket_frames(connection_id);
 		CREATE INDEX IF NOT EXISTS idx_ws_opcode ON websocket_frames(opcode);
 
 		-- SSE event entries
 		CREATE TABLE IF NOT EXISTS sse_events (
 			id TEXT PRIMARY KEY,
+			route_name TEXT NOT NULL,
 			connection_id TEXT NOT NULL,
 			timestamp TEXT NOT NULL,
 			event_type TEXT,
@@ -1052,6 +1341,7 @@ func (w *SQLiteWriter) openDB() error {
 			retry INTEGER
 		);
 		CREATE INDEX IF NOT EXISTS idx_sse_timestamp ON sse_events(timestamp);
+		CREATE INDEX IF NOT EXISTS idx_sse_route ON sse_events(route_name);
 		CREATE INDEX IF NOT EXISTS idx_sse_connection ON sse_events(connection_id);
 	`
 	if _, err := db.Exec(schema); err != nil {
@@ -1061,30 +1351,30 @@ func (w *SQLiteWriter) openDB() error {
 
 	// Prepare insert statements for each table
 	stmtHTTP, err := db.Prepare(`INSERT INTO http_entries (
-		id, timestamp, duration_ms, client_ip, error,
+		id, route_name, timestamp, duration_ms, client_ip, error,
 		req_method, req_url, req_proto, req_host, req_headers, req_body, req_body_size, req_body_truncated,
 		req_content_type, req_content_length, req_authorization, req_cookie, req_user_agent,
 		req_accept, req_accept_encoding, req_referer, req_origin, req_x_forwarded_for, req_x_request_id,
 		resp_status, resp_status_text, resp_proto, resp_headers, resp_body, resp_body_size, resp_body_truncated,
 		resp_content_type, resp_content_length, resp_content_encoding, resp_set_cookie, resp_location,
 		resp_cache_control, resp_etag, resp_last_modified, resp_www_authenticate, resp_x_request_id
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		_ = db.Close()
 		return err
 	}
 
 	stmtWS, err := db.Prepare(`INSERT INTO websocket_frames (
-		id, connection_id, timestamp, direction, opcode, opcode_name, fin, masked, payload, payload_size
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		id, route_name, connection_id, timestamp, direction, opcode, opcode_name, fin, masked, payload, payload_size
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		_ = db.Close()
 		return err
 	}
 
 	stmtSSE, err := db.Prepare(`INSERT INTO sse_events (
-		id, connection_id, timestamp, event_type, data, event_id, retry
-	) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+		id, route_name, connection_id, timestamp, event_type, data, event_id, retry
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		_ = db.Close()
 		return err
@@ -1105,6 +1395,16 @@ func (w *SQLiteWriter) openDB() error {
 }
 
 func (w *SQLiteWriter) Write(entry any) error {
+	// Filter by route if this writer is route-specific.
+	// Empty routeName means "write all routes" (shared file mode).
+	if w.routeName != "" {
+		if re, ok := entry.(RoutedEntry); ok {
+			if re.GetRouteName() != w.routeName {
+				return nil // Skip entries for other routes
+			}
+		}
+	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -1267,7 +1567,7 @@ func (w *SQLiteWriter) writeHTTPEntry(e *LogEntry) (int64, error) {
 	}
 
 	_, err := w.stmtHTTP.Exec(
-		e.ID, e.Timestamp.Format(time.RFC3339Nano), e.DurationMs, e.ClientIP, e.Error,
+		e.ID, e.RouteName, e.Timestamp.Format(time.RFC3339Nano), e.DurationMs, e.ClientIP, e.Error,
 		reqMethod, reqURL, reqProto, reqHost, reqHeaders, reqBody, reqBodySize, reqBodyTruncated,
 		reqContentType, reqContentLength, reqAuthorization, reqCookie, reqUserAgent,
 		reqAccept, reqAcceptEncoding, reqReferer, reqOrigin, reqXForwardedFor, reqXRequestID,
@@ -1296,7 +1596,7 @@ func (w *SQLiteWriter) writeWebSocketFrame(e *WebSocketFrame) (int64, error) {
 	}
 
 	_, err := w.stmtWebSocket.Exec(
-		e.ID, e.ConnectionID, e.Timestamp.Format(time.RFC3339Nano),
+		e.ID, e.RouteName, e.ConnectionID, e.Timestamp.Format(time.RFC3339Nano),
 		e.Direction, e.Opcode, e.OpcodeName, fin, masked, payload, e.PayloadSize,
 	)
 
@@ -1305,7 +1605,7 @@ func (w *SQLiteWriter) writeWebSocketFrame(e *WebSocketFrame) (int64, error) {
 
 func (w *SQLiteWriter) writeSSEEvent(e *SSEEvent) (int64, error) {
 	_, err := w.stmtSSE.Exec(
-		e.ID, e.ConnectionID, e.Timestamp.Format(time.RFC3339Nano),
+		e.ID, e.RouteName, e.ConnectionID, e.Timestamp.Format(time.RFC3339Nano),
 		e.Event, e.Data, e.IDField, e.Retry,
 	)
 
@@ -1347,7 +1647,11 @@ func (w *SQLiteWriter) rotateInternal() error {
 	timestamp := time.Now().Format("20060102_150405")
 	ext := filepath.Ext(w.basePath)
 	base := strings.TrimSuffix(w.basePath, ext)
-	rotatedPath := fmt.Sprintf("%s_%s_%s_%s%s", base, timestamp, w.listenAddr, w.upstreamAddr, ext)
+	name := w.routeName
+	if name == "" {
+		name = "shared" // Fallback for shared file mode
+	}
+	rotatedPath := fmt.Sprintf("%s_%s_%s%s", base, name, timestamp, ext)
 
 	// Rename current file (and WAL/SHM files)
 	if err := os.Rename(w.basePath, rotatedPath); err != nil {
@@ -1544,7 +1848,7 @@ func (lm *LogManager) Stop() {
 
 // ==================== Tap Transport ====================
 
-func newTapTransport(maxBodySize int64, logManager *LogManager, metrics *ProxyMetrics, insecureSkipVerify bool, shouldLog func(string) bool) *TapTransport {
+func newTapTransport(maxBodySize int64, logManager *LogManager, metrics *ProxyMetrics, insecureSkipVerify bool, routeName string, shouldLog func(string) bool) *TapTransport {
 	return &TapTransport{
 		transport: &http.Transport{
 			Proxy: http.ProxyFromEnvironment,
@@ -1562,6 +1866,7 @@ func newTapTransport(maxBodySize int64, logManager *LogManager, metrics *ProxyMe
 		logManager:  logManager,
 		maxBodySize: maxBodySize,
 		metrics:     metrics,
+		routeName:   routeName,
 		shouldLog:   shouldLog,
 	}
 }
@@ -1679,6 +1984,7 @@ func (tt *TapTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if shouldLog {
 		entry = &LogEntry{
 			ID:            uuid.New().String(),
+			RouteName:     tt.routeName,
 			CorrelationID: correlationID,
 			Timestamp:     startTime,
 			Type:          "http",
@@ -1836,7 +2142,7 @@ func cloneHeaders(h http.Header) map[string][]string {
 func (p *Proxy) createReverseProxy() *httputil.ReverseProxy {
 	proxy := &httputil.ReverseProxy{
 		// Use our tap transport
-		Transport: newTapTransport(p.cfg.MaxBodySize, p.logManager, p.metrics, p.cfg.InsecureSkipVerify, p.shouldLogPath),
+		Transport: newTapTransport(p.globalCfg.MaxBodySize, p.logManager, p.metrics, p.globalCfg.InsecureSkipVerify, p.name, p.shouldLogPath),
 
 		// Rewrite modifies the request (replaces deprecated Director)
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -1851,7 +2157,7 @@ func (p *Proxy) createReverseProxy() *httputil.ReverseProxy {
 
 	// Error handler - ensure we don't break client connection
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		log.Printf("proxy error: %v", err)
+		log.Printf("proxy %q error: %v", p.name, err)
 		// Return 502 Bad Gateway but don't panic
 		w.WriteHeader(http.StatusBadGateway)
 		_, _ = w.Write([]byte("Bad Gateway"))
@@ -1899,7 +2205,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	var err error
 
 	if upstreamScheme == "wss" {
-		upstreamConn, err = tls.DialWithDialer(dialer, "tcp", upstreamURL.Host, &tls.Config{InsecureSkipVerify: p.cfg.InsecureSkipVerify})
+		upstreamConn, err = tls.DialWithDialer(dialer, "tcp", upstreamURL.Host, &tls.Config{InsecureSkipVerify: p.globalCfg.InsecureSkipVerify})
 	} else {
 		upstreamConn, err = dialer.Dial("tcp", upstreamURL.Host)
 	}
@@ -1989,20 +2295,20 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	// Client -> Upstream
 	wg.Go(func() {
-		relayWebSocketFrames(clientBuf, upstreamConn, connID, "client_to_server", true, p.logManager, p.cfg.MaxBodySize, shouldLog, done)
+		relayWebSocketFrames(clientBuf, upstreamConn, connID, "client_to_server", true, p.logManager, p.globalCfg.MaxBodySize, p.name, shouldLog, done)
 		closeConns() // Close both when this direction ends
 	})
 
 	// Upstream -> Client
 	wg.Go(func() {
-		relayWebSocketFrames(upstreamReader, clientConn, connID, "server_to_client", false, p.logManager, p.cfg.MaxBodySize, shouldLog, done)
+		relayWebSocketFrames(upstreamReader, clientConn, connID, "server_to_client", false, p.logManager, p.globalCfg.MaxBodySize, p.name, shouldLog, done)
 		closeConns() // Close both when this direction ends
 	})
 
 	wg.Wait()
 }
 
-func relayWebSocketFrames(src io.Reader, dst io.Writer, connID, direction string, clientFrames bool, lm *LogManager, maxBodySize int64, shouldLog bool, done <-chan struct{}) {
+func relayWebSocketFrames(src io.Reader, dst io.Writer, connID, direction string, clientFrames bool, lm *LogManager, maxBodySize int64, routeName string, shouldLog bool, done <-chan struct{}) {
 	for {
 		// Check if we should stop
 		select {
@@ -2031,6 +2337,7 @@ func relayWebSocketFrames(src io.Reader, dst io.Writer, connID, direction string
 			payloadStr, payloadBase64 := encodeBody(payload)
 			logFrame := &WebSocketFrame{
 				ID:            uuid.New().String(),
+				RouteName:     routeName,
 				ConnectionID:  connID,
 				Timestamp:     time.Now(),
 				Type:          "websocket_frame",
@@ -2296,6 +2603,7 @@ func (p *Proxy) handleSSE(w http.ResponseWriter, r *http.Request) {
 			if shouldLog && data.Len() > 0 {
 				sseEvent := &SSEEvent{
 					ID:           uuid.New().String(),
+					RouteName:    p.name,
 					ConnectionID: connID,
 					Timestamp:    time.Now(),
 					Type:         "sse_event",
@@ -2413,14 +2721,36 @@ WantedBy=multi-user.target
 
 	// Build command with current flags
 	args := []string{exe}
-	if cfg.ListenHTTP != "" {
-		args = append(args, "--listen-http", cfg.ListenHTTP)
+
+	// Add proxy definitions
+	for _, pc := range cfg.Proxies {
+		var proxyParts []string
+		proxyParts = append(proxyParts, "name="+pc.Name)
+		if pc.ListenHTTP != "" {
+			proxyParts = append(proxyParts, "listen_http="+pc.ListenHTTP)
+		}
+		if pc.ListenHTTPS != "" {
+			proxyParts = append(proxyParts, "listen_https="+pc.ListenHTTPS)
+		}
+		proxyParts = append(proxyParts, "upstream="+pc.Upstream)
+		if pc.LogJSONL != "" {
+			proxyParts = append(proxyParts, "log_jsonl="+pc.LogJSONL)
+		}
+		if pc.LogSQLite != "" {
+			proxyParts = append(proxyParts, "log_sqlite="+pc.LogSQLite)
+		}
+		for _, pattern := range pc.IncludePathsRegex {
+			proxyParts = append(proxyParts, "include_path="+pattern)
+		}
+		for _, pattern := range pc.ExcludePathsRegex {
+			proxyParts = append(proxyParts, "exclude_path="+pattern)
+		}
+		args = append(args, "--proxy", strings.Join(proxyParts, ","))
 	}
-	if cfg.ListenHTTPS != "" {
-		args = append(args, "--listen-https", cfg.ListenHTTPS)
-	}
-	if cfg.Upstream != "" {
-		args = append(args, "--upstream", cfg.Upstream)
+
+	// Global settings
+	if cfg.ListenAdmin != "" {
+		args = append(args, "--listen-admin", cfg.ListenAdmin)
 	}
 	if cfg.LogJSONL != "" {
 		args = append(args, "--log-jsonl", cfg.LogJSONL)

@@ -52,7 +52,7 @@ $PROXY_BIN --help > /dev/null 2>&1 && log_info "  PASS: Help works" || { log_err
 
 # Test 2: Systemd unit generation
 log_info "Test 2: Testing systemd unit generation..."
-$PROXY_BIN --upstream http://localhost:5000 --log-jsonl /var/log/test.jsonl --print-systemd > "$TEST_DIR/systemd.unit"
+$PROXY_BIN --proxy "name=api,listen_http=:8080,upstream=http://localhost:5000,log_jsonl=/var/log/test.jsonl" --print-systemd > "$TEST_DIR/systemd.unit"
 if grep -q "ExecStart=" "$TEST_DIR/systemd.unit" && grep -q "WantedBy=multi-user.target" "$TEST_DIR/systemd.unit"; then
     log_info "  PASS: Systemd unit generated correctly"
 else
@@ -150,9 +150,7 @@ log_info "  PASS: Upstream server running (PID: $UPSTREAM_PID)"
 # Test 4: Start proxy with JSONL logging
 log_info "Test 4: Starting proxy with JSONL logging..."
 $PROXY_BIN \
-    --listen-http ":$PROXY_HTTP_PORT" \
-    --upstream "http://127.0.0.1:$UPSTREAM_PORT" \
-    --log-jsonl "$TEST_DIR/requests.jsonl" \
+    --proxy "name=test,listen_http=:$PROXY_HTTP_PORT,upstream=http://127.0.0.1:$UPSTREAM_PORT,log_jsonl=$TEST_DIR/requests.jsonl" \
     --rotate-size 10MB \
     --rotate-interval 1h \
     > "$TEST_DIR/proxy.log" 2>&1 &
@@ -242,9 +240,7 @@ sleep 1
 # Test 9: SQLite logging
 log_info "Test 9: Testing SQLite logging..."
 $PROXY_BIN \
-    --listen-http ":$PROXY_HTTP_PORT" \
-    --upstream "http://127.0.0.1:$UPSTREAM_PORT" \
-    --log-sqlite "$TEST_DIR/requests.db" \
+    --proxy "name=sqlite-test,listen_http=:$PROXY_HTTP_PORT,upstream=http://127.0.0.1:$UPSTREAM_PORT,log_sqlite=$TEST_DIR/requests.db" \
     > "$TEST_DIR/proxy2.log" 2>&1 &
 PROXY_PID=$!
 sleep 2
@@ -272,10 +268,7 @@ sleep 1
 # Test 10: Both JSONL and SQLite simultaneously
 log_info "Test 10: Testing dual logging (JSONL + SQLite)..."
 $PROXY_BIN \
-    --listen-http ":$PROXY_HTTP_PORT" \
-    --upstream "http://127.0.0.1:$UPSTREAM_PORT" \
-    --log-jsonl "$TEST_DIR/dual.jsonl" \
-    --log-sqlite "$TEST_DIR/dual.db" \
+    --proxy "name=dual-test,listen_http=:$PROXY_HTTP_PORT,upstream=http://127.0.0.1:$UPSTREAM_PORT,log_jsonl=$TEST_DIR/dual.jsonl,log_sqlite=$TEST_DIR/dual.db" \
     > "$TEST_DIR/proxy3.log" 2>&1 &
 PROXY_PID=$!
 sleep 2
@@ -300,9 +293,7 @@ sleep 1
 # Test 11: HTTPS with auto-cert
 log_info "Test 11: Testing HTTPS with auto-generated certificate..."
 $PROXY_BIN \
-    --listen-https ":$PROXY_HTTPS_PORT" \
-    --upstream "http://127.0.0.1:$UPSTREAM_PORT" \
-    --log-jsonl "$TEST_DIR/https.jsonl" \
+    --proxy "name=https-test,listen_https=:$PROXY_HTTPS_PORT,upstream=http://127.0.0.1:$UPSTREAM_PORT,log_jsonl=$TEST_DIR/https.jsonl" \
     --auto-cert \
     > "$TEST_DIR/proxy4.log" 2>&1 &
 PROXY_PID=$!
@@ -324,10 +315,8 @@ sleep 1
 # Test 12: Admin endpoints (health + metrics)
 log_info "Test 12: Testing admin endpoints on separate port..."
 $PROXY_BIN \
-    --listen-http ":$PROXY_HTTP_PORT" \
+    --proxy "name=admin-test,listen_http=:$PROXY_HTTP_PORT,upstream=http://127.0.0.1:$UPSTREAM_PORT,log_jsonl=$TEST_DIR/admin.jsonl" \
     --listen-admin ":$ADMIN_PORT" \
-    --upstream "http://127.0.0.1:$UPSTREAM_PORT" \
-    --log-jsonl "$TEST_DIR/admin.jsonl" \
     > "$TEST_DIR/proxy5.log" 2>&1 &
 PROXY_PID=$!
 sleep 2
@@ -365,10 +354,7 @@ sleep 1
 # Test 13: Path filtering (include)
 log_info "Test 13: Testing path filtering (include mode)..."
 $PROXY_BIN \
-    --listen-http ":$PROXY_HTTP_PORT" \
-    --upstream "http://127.0.0.1:$UPSTREAM_PORT" \
-    --log-jsonl "$TEST_DIR/filter_include.jsonl" \
-    --include-path "^/api/" \
+    --proxy "name=filter-inc,listen_http=:$PROXY_HTTP_PORT,upstream=http://127.0.0.1:$UPSTREAM_PORT,log_jsonl=$TEST_DIR/filter_include.jsonl,include_path=^/api/" \
     > "$TEST_DIR/proxy6.log" 2>&1 &
 PROXY_PID=$!
 sleep 2
@@ -394,10 +380,7 @@ sleep 1
 # Test 14: Path filtering (exclude)
 log_info "Test 14: Testing path filtering (exclude mode)..."
 $PROXY_BIN \
-    --listen-http ":$PROXY_HTTP_PORT" \
-    --upstream "http://127.0.0.1:$UPSTREAM_PORT" \
-    --log-jsonl "$TEST_DIR/filter_exclude.jsonl" \
-    --exclude-path "^/health" \
+    --proxy "name=filter-exc,listen_http=:$PROXY_HTTP_PORT,upstream=http://127.0.0.1:$UPSTREAM_PORT,log_jsonl=$TEST_DIR/filter_exclude.jsonl,exclude_path=^/health" \
     > "$TEST_DIR/proxy7.log" 2>&1 &
 PROXY_PID=$!
 sleep 2
@@ -423,9 +406,7 @@ sleep 1
 # Test 15: Correlation ID extraction
 log_info "Test 15: Testing correlation ID extraction..."
 $PROXY_BIN \
-    --listen-http ":$PROXY_HTTP_PORT" \
-    --upstream "http://127.0.0.1:$UPSTREAM_PORT" \
-    --log-jsonl "$TEST_DIR/correlation.jsonl" \
+    --proxy "name=corr-test,listen_http=:$PROXY_HTTP_PORT,upstream=http://127.0.0.1:$UPSTREAM_PORT,log_jsonl=$TEST_DIR/correlation.jsonl" \
     > "$TEST_DIR/proxy8.log" 2>&1 &
 PROXY_PID=$!
 sleep 2
@@ -449,9 +430,7 @@ sleep 1
 # Test 16: Concurrent requests
 log_info "Test 16: Testing concurrent requests..."
 $PROXY_BIN \
-    --listen-http ":$PROXY_HTTP_PORT" \
-    --upstream "http://127.0.0.1:$UPSTREAM_PORT" \
-    --log-jsonl "$TEST_DIR/concurrent.jsonl" \
+    --proxy "name=conc-test,listen_http=:$PROXY_HTTP_PORT,upstream=http://127.0.0.1:$UPSTREAM_PORT,log_jsonl=$TEST_DIR/concurrent.jsonl" \
     > "$TEST_DIR/proxy9.log" 2>&1 &
 PROXY_PID=$!
 sleep 2
@@ -480,8 +459,65 @@ kill $PROXY_PID 2>/dev/null || true
 wait $PROXY_PID 2>/dev/null || true
 sleep 1
 
-# Test 17: Insertion latency measurement
-log_info "Test 17: Testing insertion latency (single-process measurement)..."
+# Test 17: Multi-proxy (multiple upstreams)
+log_info "Test 17: Testing multi-proxy configuration..."
+
+# Start a second upstream on a different port
+UPSTREAM2_PORT=9877
+python3 "$TEST_DIR/upstream.py" $UPSTREAM2_PORT &
+UPSTREAM2_PID=$!
+sleep 1
+
+PROXY_HTTP_PORT2=8082
+
+$PROXY_BIN \
+    --proxy "name=api,listen_http=:$PROXY_HTTP_PORT,upstream=http://127.0.0.1:$UPSTREAM_PORT,log_jsonl=$TEST_DIR/multi_api.jsonl" \
+    --proxy "name=web,listen_http=:$PROXY_HTTP_PORT2,upstream=http://127.0.0.1:$UPSTREAM2_PORT,log_jsonl=$TEST_DIR/multi_web.jsonl" \
+    > "$TEST_DIR/proxy_multi.log" 2>&1 &
+PROXY_PID=$!
+sleep 2
+
+# Test requests to both proxies
+RESP1=$(curl -s "http://127.0.0.1:$PROXY_HTTP_PORT/api-endpoint")
+RESP2=$(curl -s "http://127.0.0.1:$PROXY_HTTP_PORT2/web-endpoint")
+sleep 1
+
+# Verify both responded
+if echo "$RESP1" | grep -q "Hello from upstream" && echo "$RESP2" | grep -q "Hello from upstream"; then
+    log_info "  PASS: Both proxies responding correctly"
+else
+    log_error "  FAIL: Multi-proxy responses failed"
+    exit 1
+fi
+
+# Verify route_name in logs
+if grep -q '"route_name":"api"' "$TEST_DIR/multi_api.jsonl" && \
+   grep -q '"route_name":"web"' "$TEST_DIR/multi_web.jsonl"; then
+    log_info "  PASS: Route names correctly captured in logs"
+else
+    log_error "  FAIL: Route names not found in logs"
+    cat "$TEST_DIR/multi_api.jsonl"
+    cat "$TEST_DIR/multi_web.jsonl"
+    exit 1
+fi
+
+# Verify each log only has its own route
+if ! grep -q '"route_name":"web"' "$TEST_DIR/multi_api.jsonl" && \
+   ! grep -q '"route_name":"api"' "$TEST_DIR/multi_web.jsonl"; then
+    log_info "  PASS: Logs correctly separated by route"
+else
+    log_error "  FAIL: Logs mixed between routes"
+    exit 1
+fi
+
+kill $PROXY_PID 2>/dev/null || true
+wait $PROXY_PID 2>/dev/null || true
+kill $UPSTREAM2_PID 2>/dev/null || true
+wait $UPSTREAM2_PID 2>/dev/null || true
+sleep 1
+
+# Test 18: Insertion latency measurement
+log_info "Test 18: Testing insertion latency (single-process measurement)..."
 
 # Kill the functional test upstream - latency test needs its own for single-clock accuracy
 kill $UPSTREAM_PID 2>/dev/null || true
@@ -614,9 +650,7 @@ PYEOF
 
 # Start proxy pointing to the latency test's upstream port
 $PROXY_BIN \
-    --listen-http ":$PROXY_HTTP_PORT" \
-    --upstream "http://127.0.0.1:$UPSTREAM_PORT" \
-    --log-jsonl "$TEST_DIR/latency.jsonl" \
+    --proxy "name=lat-test,listen_http=:$PROXY_HTTP_PORT,upstream=http://127.0.0.1:$UPSTREAM_PORT,log_jsonl=$TEST_DIR/latency.jsonl" \
     > "$TEST_DIR/proxy10.log" 2>&1 &
 PROXY_PID=$!
 sleep 2

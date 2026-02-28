@@ -30,66 +30,77 @@ go build -o http-tap-proxy .
 ## Usage
 
 ```bash
-# Basic - log to JSONL
-./http-tap-proxy --upstream http://localhost:5000 --log-jsonl ./requests.jsonl
+# Basic - single proxy with JSONL logging
+./http-tap-proxy \
+  --proxy "name=api,listen_http=:8080,upstream=http://localhost:5000,log_jsonl=./requests.jsonl"
 
 # Log to SQLite with admin endpoint
 ./http-tap-proxy \
-  --upstream http://localhost:5000 \
-  --log-sqlite ./requests.db \
+  --proxy "name=api,listen_http=:8080,upstream=http://localhost:5000,log_sqlite=./requests.db" \
   --listen-admin :9090
 
 # HTTPS with auto-cert
 ./http-tap-proxy \
-  --upstream http://localhost:5000 \
-  --listen-https :8443 \
-  --auto-cert \
-  --log-jsonl ./requests.jsonl
+  --proxy "name=api,listen_https=:8443,upstream=http://localhost:5000,log_jsonl=./requests.jsonl" \
+  --auto-cert
 
 # With path filtering (only log /api/ paths)
 ./http-tap-proxy \
-  --upstream http://localhost:5000 \
-  --log-jsonl ./requests.jsonl \
-  --include-path "^/api/"
+  --proxy "name=api,listen_http=:8080,upstream=http://localhost:5000,log_jsonl=./requests.jsonl,include_path=^/api/"
 
 # Exclude health checks from logging
 ./http-tap-proxy \
-  --upstream http://localhost:5000 \
-  --log-jsonl ./requests.jsonl \
-  --exclude-path "^/health" \
-  --exclude-path "^/ready"
+  --proxy "name=api,listen_http=:8080,upstream=http://localhost:5000,log_jsonl=./requests.jsonl,exclude_path=^/health"
+
+# Multiple proxies (multi-upstream)
+./http-tap-proxy \
+  --proxy "name=api,listen_http=:8080,upstream=http://api-backend:5000,log_jsonl=./logs/api.jsonl" \
+  --proxy "name=web,listen_http=:8081,upstream=http://web-backend:3000,log_jsonl=./logs/web.jsonl" \
+  --listen-admin :9090
+
+# Directory mode - logs named by route (api.jsonl, web.jsonl, etc.)
+./http-tap-proxy \
+  --proxy "name=api,listen_http=:8080,upstream=http://api:5000,log_jsonl=./logs/" \
+  --proxy "name=web,listen_http=:8081,upstream=http://web:3000,log_jsonl=./logs/"
 ```
 
 ## Options
 
-### Core
+### Proxy Configuration
+
+Each `--proxy` flag defines one proxy instance with comma-separated key=value pairs:
+
+| Key | Required | Description |
+|-----|----------|-------------|
+| `name` | Yes | Route name (used in logs, metrics, and filenames). Must start with a letter, only alphanumeric, underscore, and hyphen allowed. |
+| `upstream` | Yes | Target URL (e.g., `http://localhost:5000`) |
+| `listen_http` | * | HTTP listen address (e.g., `:8080`) |
+| `listen_https` | * | HTTPS listen address (e.g., `:8443`) |
+| `log_jsonl` | | JSONL log file path (or directory ending with `/`) |
+| `log_sqlite` | | SQLite database path (or directory ending with `/`) |
+| `include_path` | | Regex for paths to log (whitelist mode, can be repeated) |
+| `exclude_path` | | Regex for paths to exclude (blacklist mode, can be repeated) |
+
+\* At least one of `listen_http` or `listen_https` is required.
+
+**Directory mode:** If log path ends with `/`, files are named by route name (e.g., `./logs/` → `./logs/api.jsonl`).
+
+**Multiple path patterns:** Repeat `include_path` or `exclude_path` for multiple patterns:
+```bash
+--proxy "name=api,...,exclude_path=^/health,exclude_path=^/ready,exclude_path=^/metrics"
+```
+
+**Note:** Values cannot contain commas since comma is the delimiter. Use `|` for regex alternation (e.g., `exclude_path=^/(health|ready)`).
+
+### Global Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--upstream` | required | Target URL (e.g., `http://localhost:5000`) |
-| `--listen-http` | `:8080` | HTTP proxy address |
-| `--listen-https` | | HTTPS proxy address |
 | `--listen-admin` | | Admin port for health/metrics (recommended: `:9090`) |
-
-### Logging
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--log-jsonl` | | JSONL log file path |
-| `--log-sqlite` | | SQLite database path |
 | `--rotate-size` | `100MB` | Rotate when file exceeds size |
 | `--rotate-interval` | `1h` | Rotate at interval |
 | `--retention` | `10` | Number of rotated files to keep (when S3 not configured) |
 | `--max-body-size` | `100MB` | Max request/response body to capture |
-
-### Path Filtering
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--include-path` | | Regex for paths to log (whitelist mode, can repeat) |
-| `--exclude-path` | | Regex for paths to exclude (blacklist mode, can repeat) |
-
-If `--include-path` is set, only matching paths are logged. `--exclude-path` patterns are applied after include filtering.
 
 ### TLS
 
@@ -136,6 +147,7 @@ Each line is a JSON object with `type` field:
 ```json
 {
   "id": "uuid",
+  "route_name": "api",
   "correlation_id": "from X-Request-ID header",
   "timestamp": "2024-01-01T00:00:00Z",
   "duration_ms": 45,
@@ -163,6 +175,7 @@ Each line is a JSON object with `type` field:
 ```json
 {
   "id": "uuid",
+  "route_name": "api",
   "connection_id": "uuid",
   "timestamp": "2024-01-01T00:00:00Z",
   "type": "websocket_frame",
@@ -178,6 +191,7 @@ Each line is a JSON object with `type` field:
 ```json
 {
   "id": "uuid",
+  "route_name": "api",
   "connection_id": "uuid",
   "timestamp": "2024-01-01T00:00:00Z",
   "type": "sse_event",
@@ -197,7 +211,7 @@ Three tables with appropriate indexes:
 - `websocket_frames` - WebSocket frame data
 - `sse_events` - Server-Sent Events
 
-Bodies stored as BLOBs (binary, not base64).
+All tables include a `route_name` column (indexed) for filtering by proxy instance. Bodies stored as BLOBs (binary, not base64).
 
 ## Admin Endpoints
 
@@ -205,54 +219,44 @@ When `--listen-admin` is configured:
 
 **Health check** (`/_health`):
 ```json
-{"status": "healthy", "version": "1.0.0", "uptime": "1h30m"}
+{"status": "healthy", "version": "1.0.0", "uptime": "1h30m", "proxies": 2}
 ```
 
 **Metrics** (`/_metrics`):
+
+All metrics include a `route` label for per-proxy breakdown:
 ```
-http_tap_proxy_requests_total 12345
-http_tap_proxy_requests_active 5
-http_tap_proxy_bytes_received_total 1234567
-http_tap_proxy_bytes_sent_total 7654321
-http_tap_proxy_errors_total 3
-http_tap_proxy_websocket_connections_active 2
-http_tap_proxy_sse_connections_active 1
-http_tap_proxy_upstream_latency_avg_microseconds 1234.56
-http_tap_proxy_log_errors_total 0
+http_tap_proxy_requests_total{route="api"} 5000
+http_tap_proxy_requests_total{route="web"} 7345
+http_tap_proxy_requests_active{route="api"} 2
+http_tap_proxy_requests_active{route="web"} 3
+http_tap_proxy_bytes_received_total{route="api"} 500000
+http_tap_proxy_bytes_received_total{route="web"} 734567
+http_tap_proxy_bytes_sent_total{route="api"} 400000
+http_tap_proxy_bytes_sent_total{route="web"} 3654321
+http_tap_proxy_errors_total{route="api"} 1
+http_tap_proxy_errors_total{route="web"} 2
+http_tap_proxy_websocket_connections_active{route="api"} 1
+http_tap_proxy_websocket_connections_active{route="web"} 1
+http_tap_proxy_sse_connections_active{route="api"} 0
+http_tap_proxy_sse_connections_active{route="web"} 1
+http_tap_proxy_upstream_latency_avg_microseconds{route="api"} 1234.56
+http_tap_proxy_upstream_latency_avg_microseconds{route="web"} 2345.67
+http_tap_proxy_log_errors_total{route="api"} 0
+http_tap_proxy_log_errors_total{route="web"} 0
 http_tap_proxy_uptime_seconds 5400.00
 ```
 
-## Programmatic Usage
-
-```go
-proxy, err := NewProxy(&Config{
-    ListenHTTP:  ":8080",
-    ListenAdmin: ":9090",
-    Upstream:    "http://localhost:5000",
-    LogJSONL:    "./requests.jsonl",
-})
-if err != nil {
-    log.Fatal(err)
-}
-
-if err := proxy.Start(); err != nil {
-    log.Fatal(err)
-}
-
-// Get actual addresses (useful with port 0)
-fmt.Println("Proxy:", proxy.HTTPAddr())
-fmt.Println("Admin:", proxy.AdminAddr())
-
-// Graceful shutdown
-proxy.Close()
-```
+To aggregate across routes in Prometheus: `sum(http_tap_proxy_requests_total)`
 
 ## Service Installation
 
 ### Linux (systemd)
 
 ```bash
-./http-tap-proxy --upstream http://localhost:5000 --log-jsonl /var/log/proxy.jsonl --print-systemd > /etc/systemd/system/http-tap-proxy.service
+./http-tap-proxy \
+  --proxy "name=api,listen_http=:8080,upstream=http://localhost:5000,log_jsonl=/var/log/proxy.jsonl" \
+  --print-systemd > /etc/systemd/system/http-tap-proxy.service
 systemctl daemon-reload
 systemctl enable --now http-tap-proxy
 ```
@@ -260,7 +264,7 @@ systemctl enable --now http-tap-proxy
 ### Windows
 
 ```cmd
-http-tap-proxy.exe --upstream http://localhost:5000 --log-jsonl C:\logs\proxy.jsonl --service install
+http-tap-proxy.exe --proxy "name=api,listen_http=:8080,upstream=http://localhost:5000,log_jsonl=C:\logs\proxy.jsonl" --service install
 http-tap-proxy.exe --service start
 ```
 

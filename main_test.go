@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
 	"os"
@@ -116,46 +117,139 @@ func (u *testUpstream) GetTimestamps(reqID string) *reqTimestamps {
 
 // testProxy wraps a Proxy for testing
 type testProxy struct {
-	proxy  *Proxy
-	logDir string
+	proxy      *Proxy
+	logManager *LogManager
+	logDir     string
+}
+
+// testProxyOptions configures the test proxy
+type testProxyOptions struct {
+	name              string // proxy name (default: "test")
+	listenHTTP        string
+	listenHTTPS       string
+	upstream          string
+	logJSONL          string
+	logSQLite         string
+	maxBodySize       int64
+	autoCert          bool
+	includePathsRegex []string
+	excludePathsRegex []string
+	jsonlOnly         bool // only create JSONL writer (no SQLite) - useful for benchmarks
 }
 
 func startTestProxy(t *testing.T, upstreamURL string) *testProxy {
 	t.Helper()
+	return startTestProxyWithOptions(t, testProxyOptions{
+		upstream: upstreamURL,
+	})
+}
+
+// startTestProxyTB is like startTestProxy but works with both *testing.T and *testing.B
+func startTestProxyTB(tb testing.TB, opts testProxyOptions) *testProxy {
+	tb.Helper()
+	return startTestProxyWithOptionsTB(tb, opts)
+}
+
+func startTestProxyWithOptions(t *testing.T, opts testProxyOptions) *testProxy {
+	t.Helper()
+	return startTestProxyWithOptionsTB(t, opts)
+}
+
+func startTestProxyWithOptionsTB(tb testing.TB, opts testProxyOptions) *testProxy {
+	tb.Helper()
 
 	// Create temp dir for logs
 	logDir, err := os.MkdirTemp("", "http-tap-proxy-test-*")
 	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
+		tb.Fatalf("failed to create temp dir: %v", err)
 	}
 
-	cfg := &Config{
-		ListenHTTP:  "127.0.0.1:0", // Use port 0 to get a free port
-		Upstream:    upstreamURL,
-		LogJSONL:    filepath.Join(logDir, "requests.jsonl"),
-		LogSQLite:   filepath.Join(logDir, "requests.db"),
-		MaxBodySize: 100 * 1024 * 1024, // 100MB
+	// Set defaults
+	if opts.name == "" {
+		opts.name = "test"
+	}
+	if opts.listenHTTP == "" && opts.listenHTTPS == "" {
+		opts.listenHTTP = "127.0.0.1:0"
+	}
+	if opts.maxBodySize == 0 {
+		opts.maxBodySize = 100 * 1024 * 1024 // 100MB
 	}
 
-	proxy, err := NewProxy(cfg)
+	jsonlPath := opts.logJSONL
+	if jsonlPath == "" {
+		jsonlPath = filepath.Join(logDir, "requests.jsonl")
+	}
+	sqlitePath := opts.logSQLite
+	if sqlitePath == "" && !opts.jsonlOnly {
+		sqlitePath = filepath.Join(logDir, "requests.db")
+	}
+
+	// Create proxy config
+	proxyCfg := &ProxyConfig{
+		Name:              opts.name,
+		ListenHTTP:        opts.listenHTTP,
+		ListenHTTPS:       opts.listenHTTPS,
+		Upstream:          opts.upstream,
+		LogJSONL:          jsonlPath,
+		LogSQLite:         sqlitePath,
+		IncludePathsRegex: opts.includePathsRegex,
+		ExcludePathsRegex: opts.excludePathsRegex,
+	}
+
+	// Create global config
+	globalCfg := &Config{
+		MaxBodySize: opts.maxBodySize,
+		AutoCert:    opts.autoCert,
+		HealthPath:  "/_health",
+		MetricsPath: "/_metrics",
+	}
+
+	// Create log writers
+	var writers []LogWriter
+	if jsonlPath != "" {
+		w, err := newJSONLWriter(jsonlPath, 0, 0, nil, opts.name)
+		if err != nil {
+			_ = os.RemoveAll(logDir)
+			tb.Fatalf("failed to create JSONL writer: %v", err)
+		}
+		writers = append(writers, w)
+	}
+	if sqlitePath != "" {
+		w, err := newSQLiteWriter(sqlitePath, 0, 0, nil, opts.name)
+		if err != nil {
+			_ = os.RemoveAll(logDir)
+			tb.Fatalf("failed to create SQLite writer: %v", err)
+		}
+		writers = append(writers, w)
+	}
+
+	logManager := newLogManager(writers, 0)
+
+	proxy, err := NewProxy(proxyCfg, globalCfg, logManager)
 	if err != nil {
+		logManager.Stop()
 		_ = os.RemoveAll(logDir)
-		t.Fatalf("failed to create proxy: %v", err)
+		tb.Fatalf("failed to create proxy: %v", err)
 	}
 
 	if err := proxy.Start(); err != nil {
+		logManager.Stop()
 		_ = os.RemoveAll(logDir)
-		t.Fatalf("failed to start proxy: %v", err)
+		tb.Fatalf("failed to start proxy: %v", err)
 	}
 
 	return &testProxy{
-		proxy:  proxy,
-		logDir: logDir,
+		proxy:      proxy,
+		logManager: logManager,
+		logDir:     logDir,
 	}
 }
 
 func (p *testProxy) Close() {
 	_ = p.proxy.Close()
+	if p.logManager != nil {
+		p.logManager.Stop()
+	}
 	_ = os.RemoveAll(p.logDir)
 }
 
@@ -398,28 +492,12 @@ func TestProxy_HTTPS_AutoCert(t *testing.T) {
 	upstream := newTestUpstream(t)
 	defer upstream.Close()
 
-	logDir, err := os.MkdirTemp("", "http-tap-proxy-test-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(logDir) }()
-
-	cfg := &Config{
-		ListenHTTPS: "127.0.0.1:0",
-		Upstream:    upstream.URL(),
-		LogJSONL:    filepath.Join(logDir, "requests.jsonl"),
-		AutoCert:    true,
-	}
-
-	proxy, err := NewProxy(cfg)
-	if err != nil {
-		t.Fatalf("failed to create proxy: %v", err)
-	}
-
-	if err := proxy.Start(); err != nil {
-		t.Fatalf("failed to start proxy: %v", err)
-	}
-	defer func() { _ = proxy.Close() }()
+	proxy := startTestProxyWithOptions(t, testProxyOptions{
+		listenHTTPS: "127.0.0.1:0",
+		upstream:    upstream.URL(),
+		autoCert:    true,
+	})
+	defer proxy.Close()
 
 	// Make HTTPS request with insecure client
 	client := &http.Client{
@@ -428,7 +506,7 @@ func TestProxy_HTTPS_AutoCert(t *testing.T) {
 		},
 	}
 
-	resp, err := client.Get(fmt.Sprintf("https://%s/https-test", proxy.HTTPSAddr()))
+	resp, err := client.Get(fmt.Sprintf("https://%s/https-test", proxy.proxy.HTTPSAddr()))
 	if err != nil {
 		t.Fatalf("HTTPS request failed: %v", err)
 	}
@@ -543,25 +621,14 @@ func BenchmarkProxy_SmallRequest(b *testing.B) {
 	upstream := newTestUpstream(&testing.T{})
 	defer upstream.Close()
 
-	logDir, _ := os.MkdirTemp("", "bench-*")
-	defer func() { _ = os.RemoveAll(logDir) }()
+	proxy := startTestProxyTB(b, testProxyOptions{
+		name:      "bench",
+		upstream:  upstream.URL(),
+		jsonlOnly: true,
+	})
+	defer proxy.Close()
 
-	cfg := &Config{
-		ListenHTTP: "127.0.0.1:0",
-		Upstream:   upstream.URL(),
-		LogJSONL:   filepath.Join(logDir, "bench.jsonl"),
-	}
-
-	proxy, err := NewProxy(cfg)
-	if err != nil {
-		b.Fatalf("failed to create proxy: %v", err)
-	}
-	if err := proxy.Start(); err != nil {
-		b.Fatalf("failed to start proxy: %v", err)
-	}
-	defer func() { _ = proxy.Close() }()
-
-	proxyURL := fmt.Sprintf("http://%s", proxy.HTTPAddr())
+	proxyURL := proxy.URL()
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
@@ -597,25 +664,14 @@ func BenchmarkProxy_LargeBody(b *testing.B) {
 
 	upstreamURL := fmt.Sprintf("http://%s", listener.Addr().String())
 
-	logDir, _ := os.MkdirTemp("", "bench-*")
-	defer func() { _ = os.RemoveAll(logDir) }()
+	proxy := startTestProxyTB(b, testProxyOptions{
+		name:      "bench",
+		upstream:  upstreamURL,
+		jsonlOnly: true,
+	})
+	defer proxy.Close()
 
-	cfg := &Config{
-		ListenHTTP: "127.0.0.1:0",
-		Upstream:   upstreamURL,
-		LogJSONL:   filepath.Join(logDir, "bench.jsonl"),
-	}
-
-	proxy, err := NewProxy(cfg)
-	if err != nil {
-		b.Fatalf("failed to create proxy: %v", err)
-	}
-	if err := proxy.Start(); err != nil {
-		b.Fatalf("failed to start proxy: %v", err)
-	}
-	defer func() { _ = proxy.Close() }()
-
-	proxyURL := fmt.Sprintf("http://%s", proxy.HTTPAddr())
+	proxyURL := proxy.URL()
 	reqBody := bytes.Repeat([]byte("y"), 100*1024) // 100KB
 
 	b.ResetTimer()
@@ -659,28 +715,14 @@ func TestProxy_StressConcurrentLargeBodies(t *testing.T) {
 
 	upstreamURL := fmt.Sprintf("http://%s", listener.Addr().String())
 
-	logDir, err := os.MkdirTemp("", "stress-test-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(logDir) }()
+	proxy := startTestProxyTB(t, testProxyOptions{
+		name:      "stress",
+		upstream:  upstreamURL,
+		jsonlOnly: true,
+	})
+	defer proxy.Close()
 
-	cfg := &Config{
-		ListenHTTP: "127.0.0.1:0",
-		Upstream:   upstreamURL,
-		LogJSONL:   filepath.Join(logDir, "stress.jsonl"),
-	}
-
-	proxy, err := NewProxy(cfg)
-	if err != nil {
-		t.Fatalf("failed to create proxy: %v", err)
-	}
-	if err := proxy.Start(); err != nil {
-		t.Fatalf("failed to start proxy: %v", err)
-	}
-	defer func() { _ = proxy.Close() }()
-
-	proxyURL := fmt.Sprintf("http://%s", proxy.HTTPAddr())
+	proxyURL := proxy.URL()
 
 	const numRequests = 100
 	const bodySize = 256 * 1024 // 256KB request body
@@ -824,29 +866,15 @@ func TestProxy_WebSocket(t *testing.T) {
 
 	upstreamURL := fmt.Sprintf("http://%s", listener.Addr().String())
 
-	logDir, err := os.MkdirTemp("", "ws-test-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(logDir) }()
-
-	cfg := &Config{
-		ListenHTTP: "127.0.0.1:0",
-		Upstream:   upstreamURL,
-		LogJSONL:   filepath.Join(logDir, "ws.jsonl"),
-	}
-
-	proxy, err := NewProxy(cfg)
-	if err != nil {
-		t.Fatalf("failed to create proxy: %v", err)
-	}
-	if err := proxy.Start(); err != nil {
-		t.Fatalf("failed to start proxy: %v", err)
-	}
-	defer func() { _ = proxy.Close() }()
+	proxy := startTestProxyTB(t, testProxyOptions{
+		name:      "ws-test",
+		upstream:  upstreamURL,
+		jsonlOnly: true,
+	})
+	defer proxy.Close()
 
 	// Connect to proxy WebSocket
-	proxyAddr := proxy.HTTPAddr()
+	proxyAddr := proxy.proxy.HTTPAddr()
 	conn, err := net.Dial("tcp", proxyAddr)
 	if err != nil {
 		t.Fatalf("failed to connect to proxy: %v", err)
@@ -901,7 +929,7 @@ func TestProxy_WebSocket(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// Check that WebSocket frames were logged
-	data, err := os.ReadFile(filepath.Join(logDir, "ws.jsonl"))
+	data, err := os.ReadFile(proxy.JSONLPath())
 	if err != nil {
 		t.Fatalf("failed to read log: %v", err)
 	}
@@ -953,28 +981,14 @@ func TestProxy_SSE(t *testing.T) {
 
 	upstreamURL := fmt.Sprintf("http://%s", listener.Addr().String())
 
-	logDir, err := os.MkdirTemp("", "sse-test-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(logDir) }()
+	proxy := startTestProxyTB(t, testProxyOptions{
+		name:      "sse-test",
+		upstream:  upstreamURL,
+		jsonlOnly: true,
+	})
+	defer proxy.Close()
 
-	cfg := &Config{
-		ListenHTTP: "127.0.0.1:0",
-		Upstream:   upstreamURL,
-		LogJSONL:   filepath.Join(logDir, "sse.jsonl"),
-	}
-
-	proxy, err := NewProxy(cfg)
-	if err != nil {
-		t.Fatalf("failed to create proxy: %v", err)
-	}
-	if err := proxy.Start(); err != nil {
-		t.Fatalf("failed to start proxy: %v", err)
-	}
-	defer func() { _ = proxy.Close() }()
-
-	proxyURL := fmt.Sprintf("http://%s", proxy.HTTPAddr())
+	proxyURL := proxy.URL()
 
 	// Make SSE request
 	req, _ := http.NewRequest("GET", proxyURL+"/events", nil)
@@ -1002,7 +1016,7 @@ func TestProxy_SSE(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// Check that SSE events were logged
-	data, err := os.ReadFile(filepath.Join(logDir, "sse.jsonl"))
+	data, err := os.ReadFile(proxy.JSONLPath())
 	if err != nil {
 		t.Fatalf("failed to read log: %v", err)
 	}
@@ -1023,28 +1037,14 @@ func TestProxy_HighParallelism(t *testing.T) {
 	upstream := newTestUpstream(t)
 	defer upstream.Close()
 
-	logDir, err := os.MkdirTemp("", "parallel-test-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(logDir) }()
+	proxy := startTestProxyTB(t, testProxyOptions{
+		name:      "parallel",
+		upstream:  upstream.URL(),
+		jsonlOnly: true,
+	})
+	defer proxy.Close()
 
-	cfg := &Config{
-		ListenHTTP: "127.0.0.1:0",
-		Upstream:   upstream.URL(),
-		LogJSONL:   filepath.Join(logDir, "parallel.jsonl"),
-	}
-
-	proxy, err := NewProxy(cfg)
-	if err != nil {
-		t.Fatalf("failed to create proxy: %v", err)
-	}
-	if err := proxy.Start(); err != nil {
-		t.Fatalf("failed to start proxy: %v", err)
-	}
-	defer func() { _ = proxy.Close() }()
-
-	proxyURL := fmt.Sprintf("http://%s", proxy.HTTPAddr())
+	proxyURL := proxy.URL()
 
 	const numWorkers = 50
 	const requestsPerWorker = 100
@@ -1152,13 +1152,6 @@ func TestProxy_LatencyDiagnostic(t *testing.T) {
 		}
 	}()
 
-	// Create temp dir
-	tmpDir, err := os.MkdirTemp("", "latency-diag-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = os.RemoveAll(tmpDir) }()
-
 	// Start plain proxy (no tap) for comparison
 	upstreamURL, _ := url.Parse("http://" + upstreamAddr)
 	plainProxy := httputil.NewSingleHostReverseProxy(upstreamURL)
@@ -1169,20 +1162,14 @@ func TestProxy_LatencyDiagnostic(t *testing.T) {
 	plainAddr := plainListener.Addr().String()
 
 	// Start tap proxy
-	proxy, err := NewProxy(&Config{
-		ListenHTTP: "127.0.0.1:0",
-		Upstream:   "http://" + upstreamAddr,
-		LogJSONL:   filepath.Join(tmpDir, "diag.jsonl"),
+	proxy := startTestProxyTB(t, testProxyOptions{
+		name:      "diag",
+		upstream:  "http://" + upstreamAddr,
+		jsonlOnly: true,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := proxy.Start(); err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = proxy.Close() }()
+	defer proxy.Close()
 
-	tapAddr := proxy.HTTPAddr()
+	tapAddr := proxy.proxy.HTTPAddr()
 
 	// Measure insertion latency: time from client_send_first_byte to upstream_recv_first_byte
 	measure := func(addr string, bodySize int) time.Duration {
@@ -1365,28 +1352,15 @@ func TestProxy_PerformanceReport(t *testing.T) {
 
 	upstreamAddr := upstream.listener.Addr().String()
 
-	// Create temp dir for logs
-	tmpDir, err := os.MkdirTemp("", "perf-test-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(tmpDir) }()
-
 	// Start proxy
-	proxy, err := NewProxy(&Config{
-		ListenHTTP: "127.0.0.1:0",
-		Upstream:   "http://" + upstreamAddr,
-		LogJSONL:   filepath.Join(tmpDir, "perf.jsonl"),
+	proxy := startTestProxyTB(t, testProxyOptions{
+		name:      "perf",
+		upstream:  "http://" + upstreamAddr,
+		jsonlOnly: true,
 	})
-	if err != nil {
-		t.Fatalf("failed to create proxy: %v", err)
-	}
-	if err := proxy.Start(); err != nil {
-		t.Fatalf("failed to start proxy: %v", err)
-	}
-	defer func() { _ = proxy.Close() }()
+	defer proxy.Close()
 
-	proxyURL := "http://" + proxy.HTTPAddr()
+	proxyURL := proxy.URL()
 	client := &http.Client{
 		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
@@ -1571,7 +1545,7 @@ func TestProxy_PerformanceReport(t *testing.T) {
 	}
 
 	t.Log("")
-	t.Logf("Log file size: %s", formatBytes(getFileSize(filepath.Join(tmpDir, "perf.jsonl"))))
+	t.Logf("Log file size: %s", formatBytes(getFileSize(proxy.JSONLPath())))
 }
 
 func getFileSize(path string) int64 {
@@ -1588,29 +1562,13 @@ func TestProxy_PathFilterInclude(t *testing.T) {
 	upstream := newTestUpstream(t)
 	defer upstream.Close()
 
-	logDir, err := os.MkdirTemp("", "path-filter-test-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(logDir) }()
+	proxy := startTestProxyWithOptions(t, testProxyOptions{
+		upstream:          upstream.URL(),
+		includePathsRegex: []string{"^/api/"},
+	})
+	defer proxy.Close()
 
-	cfg := &Config{
-		ListenHTTP:        "127.0.0.1:0",
-		Upstream:          upstream.URL(),
-		LogJSONL:          filepath.Join(logDir, "requests.jsonl"),
-		IncludePathsRegex: []string{"^/api/"},
-	}
-
-	proxy, err := NewProxy(cfg)
-	if err != nil {
-		t.Fatalf("failed to create proxy: %v", err)
-	}
-	if err := proxy.Start(); err != nil {
-		t.Fatalf("failed to start proxy: %v", err)
-	}
-	defer func() { _ = proxy.Close() }()
-
-	proxyURL := fmt.Sprintf("http://%s", proxy.HTTPAddr())
+	proxyURL := proxy.URL()
 
 	// Request to /api/ should be logged
 	resp, _ := http.Get(proxyURL + "/api/users")
@@ -1625,7 +1583,7 @@ func TestProxy_PathFilterInclude(t *testing.T) {
 	// Wait for async logging
 	time.Sleep(200 * time.Millisecond)
 
-	data, err := os.ReadFile(filepath.Join(logDir, "requests.jsonl"))
+	data, err := os.ReadFile(proxy.JSONLPath())
 	if err != nil {
 		t.Fatalf("failed to read log: %v", err)
 	}
@@ -1647,29 +1605,13 @@ func TestProxy_PathFilterExclude(t *testing.T) {
 	upstream := newTestUpstream(t)
 	defer upstream.Close()
 
-	logDir, err := os.MkdirTemp("", "path-filter-test-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(logDir) }()
+	proxy := startTestProxyWithOptions(t, testProxyOptions{
+		upstream:          upstream.URL(),
+		excludePathsRegex: []string{"^/health", "^/ready"},
+	})
+	defer proxy.Close()
 
-	cfg := &Config{
-		ListenHTTP:        "127.0.0.1:0",
-		Upstream:          upstream.URL(),
-		LogJSONL:          filepath.Join(logDir, "requests.jsonl"),
-		ExcludePathsRegex: []string{"^/health", "^/ready"},
-	}
-
-	proxy, err := NewProxy(cfg)
-	if err != nil {
-		t.Fatalf("failed to create proxy: %v", err)
-	}
-	if err := proxy.Start(); err != nil {
-		t.Fatalf("failed to start proxy: %v", err)
-	}
-	defer func() { _ = proxy.Close() }()
-
-	proxyURL := fmt.Sprintf("http://%s", proxy.HTTPAddr())
+	proxyURL := proxy.URL()
 
 	// Request to /health should NOT be logged
 	resp, _ := http.Get(proxyURL + "/health")
@@ -1689,7 +1631,7 @@ func TestProxy_PathFilterExclude(t *testing.T) {
 	// Wait for async logging
 	time.Sleep(200 * time.Millisecond)
 
-	data, err := os.ReadFile(filepath.Join(logDir, "requests.jsonl"))
+	data, err := os.ReadFile(proxy.JSONLPath())
 	if err != nil {
 		t.Fatalf("failed to read log: %v", err)
 	}
@@ -1712,102 +1654,103 @@ func TestProxy_PathFilterExclude(t *testing.T) {
 
 // ============ Admin Endpoints Tests ============
 
-func TestProxy_AdminEndpoints(t *testing.T) {
-	upstream := newTestUpstream(t)
-	defer upstream.Close()
-
-	logDir, err := os.MkdirTemp("", "admin-test-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
+func TestCreateAdminHandler_Health(t *testing.T) {
+	// Create a mock proxy for testing
+	proxies := []*Proxy{
+		{name: "test-proxy", metrics: &ProxyMetrics{startTime: time.Now()}},
 	}
-	defer func() { _ = os.RemoveAll(logDir) }()
+	startTime := time.Now()
+	cfg := &Config{HealthPath: "/_health", MetricsPath: "/_metrics"}
 
-	cfg := &Config{
-		ListenHTTP:  "127.0.0.1:0",
-		ListenAdmin: "127.0.0.1:0",
-		Upstream:    upstream.URL(),
-		LogJSONL:    filepath.Join(logDir, "requests.jsonl"),
-		HealthPath:  "/_health",
-		MetricsPath: "/_metrics",
-	}
-
-	proxy, err := NewProxy(cfg)
-	if err != nil {
-		t.Fatalf("failed to create proxy: %v", err)
-	}
-	if err := proxy.Start(); err != nil {
-		t.Fatalf("failed to start proxy: %v", err)
-	}
-	defer func() { _ = proxy.Close() }()
-
-	adminURL := fmt.Sprintf("http://%s", proxy.AdminAddr())
+	handler := createAdminHandler(proxies, startTime, cfg)
 
 	// Test health endpoint
-	resp, err := http.Get(adminURL + "/_health")
-	if err != nil {
-		t.Fatalf("health request failed: %v", err)
-	}
-	body, _ := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
+	req := httptest.NewRequest("GET", "/_health", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
 
-	if resp.StatusCode != 200 {
-		t.Errorf("expected status 200, got %d", resp.StatusCode)
+	if rr.Code != http.StatusOK {
+		t.Errorf("health endpoint returned wrong status: got %d, want %d", rr.Code, http.StatusOK)
 	}
-	if !bytes.Contains(body, []byte(`"status":"healthy"`)) {
-		t.Errorf("expected healthy status in response: %s", body)
+
+	body := rr.Body.String()
+	if !strings.Contains(body, `"status":"healthy"`) {
+		t.Errorf("health endpoint missing status field: %s", body)
 	}
+	if !strings.Contains(body, `"version"`) {
+		t.Errorf("health endpoint missing version field: %s", body)
+	}
+	if !strings.Contains(body, `"proxies":1`) {
+		t.Errorf("health endpoint missing proxies count: %s", body)
+	}
+}
+
+func TestCreateAdminHandler_Metrics(t *testing.T) {
+	// Create mock proxies with some metrics
+	proxies := []*Proxy{
+		{
+			name: "api",
+			metrics: &ProxyMetrics{
+				startTime: time.Now(),
+			},
+		},
+		{
+			name: "web",
+			metrics: &ProxyMetrics{
+				startTime: time.Now(),
+			},
+		},
+	}
+	// Set some metric values
+	proxies[0].metrics.RequestsTotal.Store(100)
+	proxies[0].metrics.BytesReceived.Store(5000)
+	proxies[1].metrics.RequestsTotal.Store(200)
+	proxies[1].metrics.ErrorsTotal.Store(5)
+
+	startTime := time.Now()
+	cfg := &Config{HealthPath: "/_health", MetricsPath: "/_metrics"}
+
+	handler := createAdminHandler(proxies, startTime, cfg)
 
 	// Test metrics endpoint
-	resp, err = http.Get(adminURL + "/_metrics")
-	if err != nil {
-		t.Fatalf("metrics request failed: %v", err)
-	}
-	body, _ = io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
+	req := httptest.NewRequest("GET", "/_metrics", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
 
-	if resp.StatusCode != 200 {
-		t.Errorf("expected status 200, got %d", resp.StatusCode)
+	if rr.Code != http.StatusOK {
+		t.Errorf("metrics endpoint returned wrong status: got %d, want %d", rr.Code, http.StatusOK)
 	}
-	if !bytes.Contains(body, []byte("http_tap_proxy_requests_total")) {
-		t.Errorf("expected metrics in response: %s", body)
+
+	body := rr.Body.String()
+
+	// Check for per-route metrics
+	if !strings.Contains(body, `http_tap_proxy_requests_total{route="api"} 100`) {
+		t.Errorf("metrics missing api requests_total: %s", body)
 	}
-	if !bytes.Contains(body, []byte("http_tap_proxy_uptime_seconds")) {
-		t.Errorf("expected uptime metric in response: %s", body)
+	if !strings.Contains(body, `http_tap_proxy_requests_total{route="web"} 200`) {
+		t.Errorf("metrics missing web requests_total: %s", body)
+	}
+	if !strings.Contains(body, `http_tap_proxy_errors_total{route="web"} 5`) {
+		t.Errorf("metrics missing web errors_total: %s", body)
+	}
+	if !strings.Contains(body, `http_tap_proxy_bytes_received_total{route="api"} 5000`) {
+		t.Errorf("metrics missing api bytes_received: %s", body)
+	}
+	if !strings.Contains(body, "http_tap_proxy_uptime_seconds") {
+		t.Errorf("metrics missing uptime_seconds: %s", body)
 	}
 }
 
 func TestProxy_AdminNotOnProxyPort(t *testing.T) {
+	// This test verifies that /_health on the proxy port goes to upstream, not admin
 	upstream := newTestUpstream(t)
 	defer upstream.Close()
 
-	logDir, err := os.MkdirTemp("", "admin-test-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(logDir) }()
+	proxy := startTestProxy(t, upstream.URL())
+	defer proxy.Close()
 
-	cfg := &Config{
-		ListenHTTP:  "127.0.0.1:0",
-		ListenAdmin: "127.0.0.1:0",
-		Upstream:    upstream.URL(),
-		LogJSONL:    filepath.Join(logDir, "requests.jsonl"),
-		HealthPath:  "/_health",
-		MetricsPath: "/_metrics",
-	}
-
-	proxy, err := NewProxy(cfg)
-	if err != nil {
-		t.Fatalf("failed to create proxy: %v", err)
-	}
-	if err := proxy.Start(); err != nil {
-		t.Fatalf("failed to start proxy: %v", err)
-	}
-	defer func() { _ = proxy.Close() }()
-
-	proxyURL := fmt.Sprintf("http://%s", proxy.HTTPAddr())
-
-	// Request to /_health on proxy port should go to upstream (not intercepted)
-	resp, err := http.Get(proxyURL + "/_health")
+	// Request to /_health on proxy port should go to upstream
+	resp, err := http.Get(proxy.URL() + "/_health")
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
@@ -1815,11 +1758,11 @@ func TestProxy_AdminNotOnProxyPort(t *testing.T) {
 	_ = resp.Body.Close()
 
 	// Should get upstream response, not health endpoint
-	if bytes.Contains(body, []byte(`"status":"healthy"`)) {
+	if strings.Contains(string(body), `"status":"healthy"`) {
 		t.Errorf("/_health should NOT be intercepted on proxy port")
 	}
-	if !bytes.Contains(body, []byte("Hello from upstream")) {
-		t.Errorf("expected upstream response on proxy port")
+	if !strings.Contains(string(body), "Hello from upstream") {
+		t.Errorf("expected upstream response on proxy port, got: %s", body)
 	}
 }
 
@@ -1829,28 +1772,12 @@ func TestProxy_CorrelationID(t *testing.T) {
 	upstream := newTestUpstream(t)
 	defer upstream.Close()
 
-	logDir, err := os.MkdirTemp("", "corr-id-test-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(logDir) }()
+	proxy := startTestProxyWithOptions(t, testProxyOptions{
+		upstream: upstream.URL(),
+	})
+	defer proxy.Close()
 
-	cfg := &Config{
-		ListenHTTP: "127.0.0.1:0",
-		Upstream:   upstream.URL(),
-		LogJSONL:   filepath.Join(logDir, "requests.jsonl"),
-	}
-
-	proxy, err := NewProxy(cfg)
-	if err != nil {
-		t.Fatalf("failed to create proxy: %v", err)
-	}
-	if err := proxy.Start(); err != nil {
-		t.Fatalf("failed to start proxy: %v", err)
-	}
-	defer func() { _ = proxy.Close() }()
-
-	proxyURL := fmt.Sprintf("http://%s", proxy.HTTPAddr())
+	proxyURL := proxy.URL()
 
 	// Test X-Request-ID
 	req, _ := http.NewRequest("GET", proxyURL+"/test1", nil)
@@ -1876,7 +1803,7 @@ func TestProxy_CorrelationID(t *testing.T) {
 	// Wait for async logging
 	time.Sleep(200 * time.Millisecond)
 
-	data, err := os.ReadFile(filepath.Join(logDir, "requests.jsonl"))
+	data, err := os.ReadFile(proxy.JSONLPath())
 	if err != nil {
 		t.Fatalf("failed to read log: %v", err)
 	}
@@ -1914,31 +1841,15 @@ func TestProxy_BodyTruncation(t *testing.T) {
 
 	upstreamURL := fmt.Sprintf("http://%s", listener.Addr().String())
 
-	logDir, err := os.MkdirTemp("", "truncate-test-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(logDir) }()
-
 	// Set max body size to 50KB
 	maxBodySize := int64(50 * 1024)
-	cfg := &Config{
-		ListenHTTP:  "127.0.0.1:0",
-		Upstream:    upstreamURL,
-		LogJSONL:    filepath.Join(logDir, "requests.jsonl"),
-		MaxBodySize: maxBodySize,
-	}
+	proxy := startTestProxyWithOptions(t, testProxyOptions{
+		upstream:    upstreamURL,
+		maxBodySize: maxBodySize,
+	})
+	defer proxy.Close()
 
-	proxy, err := NewProxy(cfg)
-	if err != nil {
-		t.Fatalf("failed to create proxy: %v", err)
-	}
-	if err := proxy.Start(); err != nil {
-		t.Fatalf("failed to start proxy: %v", err)
-	}
-	defer func() { _ = proxy.Close() }()
-
-	proxyURL := fmt.Sprintf("http://%s", proxy.HTTPAddr())
+	proxyURL := proxy.URL()
 
 	// Send 100KB request body
 	largeReqBody := bytes.Repeat([]byte("X"), 100*1024)
@@ -1958,7 +1869,7 @@ func TestProxy_BodyTruncation(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 
 	// Check log file
-	data, err := os.ReadFile(filepath.Join(logDir, "requests.jsonl"))
+	data, err := os.ReadFile(proxy.JSONLPath())
 	if err != nil {
 		t.Fatalf("failed to read log: %v", err)
 	}
@@ -2111,4 +2022,98 @@ func computeWebSocketAccept(key string) string {
 	h := sha1.New()
 	_, _ = h.Write([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
 	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
+
+// ============ Proxy Config Parsing Tests ============
+
+func TestParseProxyFlag_ValidNames(t *testing.T) {
+	validNames := []string{
+		"api",
+		"web",
+		"myAPI",
+		"my-api",
+		"my_api",
+		"api123",
+		"API-v2",
+		"a",
+	}
+
+	for _, name := range validNames {
+		t.Run(name, func(t *testing.T) {
+			flag := fmt.Sprintf("name=%s,listen_http=:8080,upstream=http://localhost:5000", name)
+			pc, err := parseProxyFlag(flag)
+			if err != nil {
+				t.Errorf("expected valid name %q to be accepted, got error: %v", name, err)
+			}
+			if pc != nil && pc.Name != name {
+				t.Errorf("expected name %q, got %q", name, pc.Name)
+			}
+		})
+	}
+}
+
+func TestParseProxyFlag_InvalidNames(t *testing.T) {
+	invalidNames := []struct {
+		name   string
+		reason string
+	}{
+		{"123api", "starts with number"},
+		{"-api", "starts with hyphen"},
+		{"_api", "starts with underscore"},
+		{"api.v2", "contains dot"},
+		{"api/v2", "contains slash"},
+		{"api:v2", "contains colon"},
+		{"api v2", "contains space"},
+		{"api\"test", "contains quote"},
+		{"api\ntest", "contains newline"},
+	}
+
+	for _, tc := range invalidNames {
+		t.Run(tc.reason, func(t *testing.T) {
+			flag := fmt.Sprintf("name=%s,listen_http=:8080,upstream=http://localhost:5000", tc.name)
+			_, err := parseProxyFlag(flag)
+			if err == nil {
+				t.Errorf("expected invalid name %q (%s) to be rejected, but it was accepted", tc.name, tc.reason)
+			}
+			if err != nil && !strings.Contains(err.Error(), "invalid") {
+				t.Errorf("expected error to mention 'invalid', got: %v", err)
+			}
+		})
+	}
+}
+
+func TestParseProxyFlag_RequiredFields(t *testing.T) {
+	tests := []struct {
+		name    string
+		flag    string
+		wantErr string
+	}{
+		{
+			name:    "missing name",
+			flag:    "listen_http=:8080,upstream=http://localhost:5000",
+			wantErr: "missing required 'name'",
+		},
+		{
+			name:    "missing upstream",
+			flag:    "name=api,listen_http=:8080",
+			wantErr: "missing required 'upstream'",
+		},
+		{
+			name:    "missing listen address",
+			flag:    "name=api,upstream=http://localhost:5000",
+			wantErr: "must have at least one of",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseProxyFlag(tc.flag)
+			if err == nil {
+				t.Errorf("expected error containing %q, got nil", tc.wantErr)
+			}
+			if err != nil && !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("expected error containing %q, got: %v", tc.wantErr, err)
+			}
+		})
+	}
 }
