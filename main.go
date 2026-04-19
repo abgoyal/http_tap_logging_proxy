@@ -184,15 +184,16 @@ type WebSocketFrame struct {
 
 // SSEEvent represents a Server-Sent Event
 type SSEEvent struct {
-	ID           string    `json:"id"`
-	RouteName    string    `json:"route_name"` // Proxy route name
-	ConnectionID string    `json:"connection_id"`
-	Timestamp    time.Time `json:"timestamp"`
-	Type         string    `json:"type"`
-	Event        string    `json:"event"`
-	Data         string    `json:"data"`
-	IDField      string    `json:"id_field,omitempty"`
-	Retry        *int      `json:"retry,omitempty"`
+	ID            string    `json:"id"`
+	RouteName     string    `json:"route_name"` // Proxy route name
+	ConnectionID  string    `json:"connection_id"`
+	Timestamp     time.Time `json:"timestamp"`
+	Type          string    `json:"type"`
+	Event         string    `json:"event"`
+	Data          string    `json:"data"`
+	DataTruncated bool      `json:"data_truncated,omitempty"` // True if data exceeded size limit
+	IDField       string    `json:"id_field,omitempty"`
+	Retry         *int      `json:"retry,omitempty"`
 }
 
 // RoutedEntry interface for log entries that have a route name
@@ -212,6 +213,7 @@ func (e *SSEEvent) GetRouteName() string { return e.RouteName }
 // LogWriter interface for different log outputs
 type LogWriter interface {
 	Write(entry any) error
+	WriteBatch(entries []any) error // Batch write for efficiency
 	Close() error
 	Rotate() error
 	Size() int64
@@ -229,6 +231,8 @@ type JSONLWriter struct {
 	routeName  string // Used in rotated filenames
 }
 
+const sqliteRowOverhead = 100 // Approximate bytes per row for size tracking
+
 // SQLiteWriter writes entries to SQLite database
 type SQLiteWriter struct {
 	mu            sync.Mutex
@@ -245,11 +249,16 @@ type SQLiteWriter struct {
 	writeCount    int // Counter for periodic size check
 }
 
-// S3Uploader handles uploading files to S3
+// S3Uploader handles uploading files to S3 with a single worker and retry logic
 type S3Uploader struct {
-	client *s3.Client
-	bucket string
-	prefix string
+	client   *s3.Client
+	bucket   string
+	prefix   string
+	queue    chan string   // Files to upload
+	done     chan struct{} // Shutdown signal
+	wg       sync.WaitGroup
+	patterns []string // Glob patterns for rotated files
+	verbose  bool     // Enable verbose logging
 }
 
 // LogManager handles multiple log writers and rotation
@@ -259,6 +268,10 @@ type LogManager struct {
 	done           chan struct{}
 	wg             sync.WaitGroup
 	errorCount     atomic.Int64
+	entryChan      chan any
+	droppedCount   atomic.Int64
+	queuedBytes    atomic.Int64 // Track memory pressure
+	maxQueuedBytes int64        // Limit total queued bytes
 }
 
 // TapTransport wraps http.RoundTripper to log requests/responses
@@ -474,7 +487,26 @@ func (p *Proxy) getTLSConfig() (*tls.Config, error) {
 
 // initProxies initializes and starts all proxy instances.
 // Returns the proxies and log manager, or an error.
-func initProxies(c *Config) ([]*Proxy, *LogManager, error) {
+// buildS3Patterns creates glob patterns for finding rotated files
+func buildS3Patterns(logPaths []string) []string {
+	seen := make(map[string]bool)
+	var patterns []string
+
+	for _, path := range logPaths {
+		ext := filepath.Ext(path)
+		base := strings.TrimSuffix(path, ext)
+		// Rotated files are named: {base}_{routename}_{timestamp}{ext}
+		pattern := base + "_*" + ext
+		if !seen[pattern] {
+			seen[pattern] = true
+			patterns = append(patterns, pattern)
+		}
+	}
+
+	return patterns
+}
+
+func initProxies(c *Config) ([]*Proxy, *LogManager, *S3Uploader, error) {
 	// Set defaults
 	if c.MaxBodySize == 0 {
 		c.MaxBodySize = 100 * 1024 * 1024
@@ -486,25 +518,20 @@ func initProxies(c *Config) ([]*Proxy, *LogManager, error) {
 		c.MetricsPath = "/_metrics"
 	}
 
-	// Initialize S3 uploader if configured
-	var s3Uploader *S3Uploader
-	if c.S3Bucket != "" {
-		var err error
-		s3Uploader, err = newS3Uploader(c.S3Bucket, c.S3Prefix, c.S3Endpoint)
-		if err != nil {
-			log.Printf("WARNING: S3 upload disabled: %v", err)
-		}
-	}
-
 	// Create log writers
 	// writerCache deduplicates writers by path - shared paths get empty routeName
 	var writers []LogWriter
+	var s3Uploader *S3Uploader
 	writerCache := make(map[string]LogWriter)
+	var logPaths []string // Collect for S3 orphan scanning
 
 	// Helper to close all writers on error (before logManager is created)
 	closeWriters := func() {
 		for _, w := range writers {
 			_ = w.Close()
+		}
+		if s3Uploader != nil {
+			s3Uploader.Stop()
 		}
 	}
 
@@ -527,6 +554,38 @@ func initProxies(c *Config) ([]*Proxy, *LogManager, error) {
 	jsonlShared := isSharedPath(c.LogJSONL)
 	sqliteShared := isSharedPath(c.LogSQLite)
 
+	// First pass: collect all log paths
+	for i := range c.Proxies {
+		pc := &c.Proxies[i]
+
+		jsonlPath := pc.LogJSONL
+		if jsonlPath == "" {
+			jsonlPath = resolveLogPath(c.LogJSONL, pc.Name, ".jsonl")
+		}
+		if jsonlPath != "" {
+			logPaths = append(logPaths, jsonlPath)
+		}
+
+		sqlitePath := pc.LogSQLite
+		if sqlitePath == "" {
+			sqlitePath = resolveLogPath(c.LogSQLite, pc.Name, ".db")
+		}
+		if sqlitePath != "" {
+			logPaths = append(logPaths, sqlitePath)
+		}
+	}
+
+	// Initialize S3 uploader if configured (with patterns for orphan scanning)
+	if c.S3Bucket != "" {
+		patterns := buildS3Patterns(logPaths)
+		var err error
+		s3Uploader, err = newS3Uploader(c.S3Bucket, c.S3Prefix, c.S3Endpoint, patterns, c.Verbose)
+		if err != nil {
+			log.Printf("WARNING: S3 upload disabled: %v", err)
+		}
+	}
+
+	// Second pass: create writers
 	for i := range c.Proxies {
 		pc := &c.Proxies[i]
 
@@ -545,7 +604,7 @@ func initProxies(c *Config) ([]*Proxy, *LogManager, error) {
 				w, err := newJSONLWriter(jsonlPath, c.RotateSize, c.Retention, s3Uploader, routeName)
 				if err != nil {
 					closeWriters()
-					return nil, nil, fmt.Errorf("failed to create JSONL writer for proxy %q: %w", pc.Name, err)
+					return nil, nil, nil, fmt.Errorf("failed to create JSONL writer for proxy %q: %w", pc.Name, err)
 				}
 				writers = append(writers, w)
 				writerCache[jsonlPath] = w
@@ -566,7 +625,7 @@ func initProxies(c *Config) ([]*Proxy, *LogManager, error) {
 				w, err := newSQLiteWriter(sqlitePath, c.RotateSize, c.Retention, s3Uploader, routeName)
 				if err != nil {
 					closeWriters()
-					return nil, nil, fmt.Errorf("failed to create SQLite writer for proxy %q: %w", pc.Name, err)
+					return nil, nil, nil, fmt.Errorf("failed to create SQLite writer for proxy %q: %w", pc.Name, err)
 				}
 				writers = append(writers, w)
 				writerCache[sqlitePath] = w
@@ -575,7 +634,10 @@ func initProxies(c *Config) ([]*Proxy, *LogManager, error) {
 	}
 
 	if len(writers) == 0 {
-		return nil, nil, errors.New("no log writers configured")
+		if s3Uploader != nil {
+			s3Uploader.Stop()
+		}
+		return nil, nil, nil, errors.New("no log writers configured")
 	}
 
 	logManager := newLogManager(writers, c.RotateInterval)
@@ -594,23 +656,29 @@ func initProxies(c *Config) ([]*Proxy, *LogManager, error) {
 		if err != nil {
 			closeProxies(proxies)
 			logManager.Stop()
-			return nil, nil, fmt.Errorf("failed to create proxy %q: %w", pc.Name, err)
+			if s3Uploader != nil {
+				s3Uploader.Stop()
+			}
+			return nil, nil, nil, fmt.Errorf("failed to create proxy %q: %w", pc.Name, err)
 		}
 		proxies = append(proxies, proxy)
 
 		if err := proxy.Start(); err != nil {
 			closeProxies(proxies)
 			logManager.Stop()
-			return nil, nil, fmt.Errorf("failed to start proxy %q: %w", pc.Name, err)
+			if s3Uploader != nil {
+				s3Uploader.Stop()
+			}
+			return nil, nil, nil, fmt.Errorf("failed to start proxy %q: %w", pc.Name, err)
 		}
 	}
 
-	return proxies, logManager, nil
+	return proxies, logManager, s3Uploader, nil
 }
 
 // createAdminHandler creates the HTTP handler for admin endpoints (health/metrics).
 // This is shared between main() and Windows service.
-func createAdminHandler(proxies []*Proxy, startTime time.Time, c *Config) http.Handler {
+func createAdminHandler(proxies []*Proxy, logManager *LogManager, startTime time.Time, c *Config) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc(c.HealthPath, func(w http.ResponseWriter, r *http.Request) {
@@ -691,6 +759,25 @@ func createAdminHandler(proxies []*Proxy, startTime time.Time, c *Config) http.H
 		_, _ = fmt.Fprintf(w, "# HELP http_tap_proxy_uptime_seconds Process uptime in seconds\n")
 		_, _ = fmt.Fprintf(w, "# TYPE http_tap_proxy_uptime_seconds gauge\n")
 		_, _ = fmt.Fprintf(w, "http_tap_proxy_uptime_seconds %.2f\n", time.Since(startTime).Seconds())
+
+		// Log queue metrics (only if logManager is available)
+		if logManager != nil {
+			_, _ = fmt.Fprintf(w, "# HELP http_tap_proxy_log_queue_bytes Current bytes queued for logging\n")
+			_, _ = fmt.Fprintf(w, "# TYPE http_tap_proxy_log_queue_bytes gauge\n")
+			_, _ = fmt.Fprintf(w, "http_tap_proxy_log_queue_bytes %d\n", logManager.queuedBytes.Load())
+
+			_, _ = fmt.Fprintf(w, "# HELP http_tap_proxy_log_queue_entries Current entries in log queue\n")
+			_, _ = fmt.Fprintf(w, "# TYPE http_tap_proxy_log_queue_entries gauge\n")
+			_, _ = fmt.Fprintf(w, "http_tap_proxy_log_queue_entries %d\n", len(logManager.entryChan))
+
+			_, _ = fmt.Fprintf(w, "# HELP http_tap_proxy_log_dropped_total Total log entries dropped due to backpressure\n")
+			_, _ = fmt.Fprintf(w, "# TYPE http_tap_proxy_log_dropped_total counter\n")
+			_, _ = fmt.Fprintf(w, "http_tap_proxy_log_dropped_total %d\n", logManager.droppedCount.Load())
+		}
+
+		_, _ = fmt.Fprintf(w, "# HELP http_tap_proxy_goroutines Current number of goroutines\n")
+		_, _ = fmt.Fprintf(w, "# TYPE http_tap_proxy_goroutines gauge\n")
+		_, _ = fmt.Fprintf(w, "http_tap_proxy_goroutines %d\n", runtime.NumGoroutine())
 	})
 
 	return mux
@@ -710,7 +797,7 @@ func main() {
 		return
 	}
 
-	proxies, logManager, err := initProxies(cfg)
+	proxies, logManager, s3Uploader, err := initProxies(cfg)
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
@@ -728,7 +815,7 @@ func main() {
 			log.Fatalf("failed to listen on admin port %s: %v", cfg.ListenAdmin, err)
 		}
 
-		adminServer = &http.Server{Handler: createAdminHandler(proxies, startTime, cfg)}
+		adminServer = &http.Server{Handler: createAdminHandler(proxies, logManager, startTime, cfg)}
 		go func() {
 			if err := adminServer.Serve(adminListener); err != http.ErrServerClosed {
 				log.Printf("Admin server error: %v", err)
@@ -772,6 +859,11 @@ func main() {
 
 	// Stop log manager
 	logManager.Stop()
+
+	// Stop S3 uploader (waits for pending uploads)
+	if s3Uploader != nil {
+		s3Uploader.Stop()
+	}
 
 	log.Println("Shutdown complete")
 }
@@ -860,7 +952,7 @@ func parseFlags() *Config {
 	var rotateIntervalStr string
 	flag.StringVar(&rotateIntervalStr, "rotate-interval", "1h", "Rotate logs at interval (e.g., 1h, 24h)")
 
-	flag.IntVar(&cfg.Retention, "retention", 10, "Number of rotated files to keep")
+	flag.IntVar(&cfg.Retention, "retention", 10, "Number of rotated files to keep (-1 for unlimited)")
 	flag.StringVar(&cfg.S3Bucket, "s3-bucket", "", "S3 bucket for archival")
 	flag.StringVar(&cfg.S3Prefix, "s3-prefix", "", "S3 key prefix for uploads")
 	flag.StringVar(&cfg.S3Endpoint, "s3-endpoint", "", "S3-compatible endpoint URL")
@@ -1080,7 +1172,10 @@ func (w *JSONLWriter) Write(entry any) error {
 	defer w.mu.Unlock()
 
 	if w.file == nil {
-		return fmt.Errorf("file is nil")
+		// Try to recover by reopening the file
+		if err := w.openFile(); err != nil {
+			return fmt.Errorf("file is nil and reopen failed: %w", err)
+		}
 	}
 
 	data, err := json.Marshal(entry)
@@ -1090,6 +1185,59 @@ func (w *JSONLWriter) Write(entry any) error {
 	data = append(data, '\n')
 
 	n, err := w.file.Write(data)
+	if err != nil {
+		return fmt.Errorf("file write: %w", err)
+	}
+	w.size += int64(n)
+
+	// Check if rotation needed
+	if w.rotateSize > 0 && w.size >= w.rotateSize {
+		return w.rotateInternal()
+	}
+
+	return nil
+}
+
+func (w *JSONLWriter) WriteBatch(entries []any) error {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.file == nil {
+		if err := w.openFile(); err != nil {
+			return fmt.Errorf("file is nil and reopen failed: %w", err)
+		}
+	}
+
+	// Build batch in memory, single write
+	var buf bytes.Buffer
+	for _, entry := range entries {
+		// Filter by route
+		if w.routeName != "" {
+			if re, ok := entry.(RoutedEntry); ok {
+				if re.GetRouteName() != w.routeName {
+					continue
+				}
+			}
+		}
+
+		data, err := json.Marshal(entry)
+		if err != nil {
+			log.Printf("json marshal error in batch: %v", err)
+			continue // Skip bad entries, don't fail batch
+		}
+		buf.Write(data)
+		buf.WriteByte('\n')
+	}
+
+	if buf.Len() == 0 {
+		return nil
+	}
+
+	n, err := w.file.Write(buf.Bytes())
 	if err != nil {
 		return fmt.Errorf("file write: %w", err)
 	}
@@ -1120,10 +1268,14 @@ func (w *JSONLWriter) rotateInternal() error {
 		return nil
 	}
 
+	// Sync before close to ensure all data is written (important on Windows)
+	_ = w.file.Sync()
+
 	// Close current file
 	if err := w.file.Close(); err != nil {
 		return err
 	}
+	w.file = nil // Mark as closed
 
 	// Generate rotated filename
 	timestamp := time.Now().Format("20060102_150405")
@@ -1135,25 +1287,26 @@ func (w *JSONLWriter) rotateInternal() error {
 	}
 	rotatedPath := fmt.Sprintf("%s_%s_%s%s", base, name, timestamp, ext)
 
-	// Rename current file
-	if err := os.Rename(w.basePath, rotatedPath); err != nil {
+	// Rename current file (with retry for Windows file locking issues)
+	var renameErr error
+	for i := range 3 {
+		if i > 0 {
+			time.Sleep(100 * time.Millisecond) // Brief delay for Windows to release file handle
+		}
+		renameErr = os.Rename(w.basePath, rotatedPath)
+		if renameErr == nil {
+			break
+		}
+	}
+	if renameErr != nil {
 		// If rename fails, try to reopen original
 		_ = w.openFile()
-		return err
+		return renameErr
 	}
 
-	// Upload to S3 if configured, delete file after successful upload
+	// Queue for S3 upload if configured (worker handles retry and deletion)
 	if w.uploader != nil {
-		go func() {
-			if err := w.uploader.Upload(rotatedPath); err != nil {
-				log.Printf("S3 upload failed for %s: %v (file retained for retry)", rotatedPath, err)
-			} else {
-				// Successfully uploaded, delete local file
-				if err := os.Remove(rotatedPath); err != nil {
-					log.Printf("failed to delete uploaded file %s: %v", rotatedPath, err)
-				}
-			}
-		}()
+		w.uploader.Queue(rotatedPath)
 	} else {
 		// No S3 configured - enforce local retention
 		w.enforceRetention()
@@ -1165,6 +1318,9 @@ func (w *JSONLWriter) rotateInternal() error {
 }
 
 func (w *JSONLWriter) enforceRetention() {
+	if w.retention < 0 {
+		return // Unlimited retention
+	}
 	pattern := strings.TrimSuffix(w.basePath, filepath.Ext(w.basePath)) + "_*" + filepath.Ext(w.basePath)
 	matches, err := filepath.Glob(pattern)
 	if err != nil {
@@ -1393,6 +1549,13 @@ func (w *SQLiteWriter) Write(entry any) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	if w.db == nil {
+		// Try to recover by reopening the database
+		if err := w.openDB(); err != nil {
+			return fmt.Errorf("db is nil and reopen failed: %w", err)
+		}
+	}
+
 	var err error
 	var dataSize int64
 
@@ -1420,8 +1583,88 @@ func (w *SQLiteWriter) Write(entry any) error {
 		}
 	} else {
 		// Estimate based on data written
-		w.size += dataSize + 100 // Approximate overhead per row
+		w.size += dataSize + sqliteRowOverhead
 	}
+
+	// Check if rotation needed
+	if w.rotateSize > 0 && w.size >= w.rotateSize {
+		return w.rotateInternal()
+	}
+
+	return nil
+}
+
+func (w *SQLiteWriter) WriteBatch(entries []any) error {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.db == nil {
+		if err := w.openDB(); err != nil {
+			return fmt.Errorf("db is nil and reopen failed: %w", err)
+		}
+	}
+
+	// Begin transaction for batch efficiency (single fsync instead of N)
+	if _, err := w.db.Exec("BEGIN TRANSACTION"); err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+
+	var totalSize int64
+	var writeCount int
+	var batchErr error
+
+	for _, entry := range entries {
+		// Filter by route
+		if w.routeName != "" {
+			if re, ok := entry.(RoutedEntry); ok {
+				if re.GetRouteName() != w.routeName {
+					continue
+				}
+			}
+		}
+
+		var dataSize int64
+		var writeErr error
+
+		switch e := entry.(type) {
+		case *LogEntry:
+			dataSize, writeErr = w.writeHTTPEntry(e)
+		case *WebSocketFrame:
+			dataSize, writeErr = w.writeWebSocketFrame(e)
+		case *SSEEvent:
+			dataSize, writeErr = w.writeSSEEvent(e)
+		default:
+			log.Printf("unknown entry type in batch: %T", entry)
+			continue // Skip unknown types
+		}
+
+		if writeErr != nil {
+			batchErr = writeErr
+			break // Stop on error, will rollback
+		}
+
+		totalSize += dataSize + sqliteRowOverhead
+		writeCount++
+	}
+
+	// Commit or rollback
+	if batchErr != nil {
+		if _, rollErr := w.db.Exec("ROLLBACK"); rollErr != nil {
+			log.Printf("rollback failed: %v", rollErr)
+		}
+		return batchErr
+	}
+
+	if _, err := w.db.Exec("COMMIT"); err != nil {
+		return fmt.Errorf("commit transaction: %w", err)
+	}
+
+	w.writeCount += writeCount
+	w.size += totalSize
 
 	// Check if rotation needed
 	if w.rotateSize > 0 && w.size >= w.rotateSize {
@@ -1617,16 +1860,20 @@ func (w *SQLiteWriter) rotateInternal() error {
 	// Close current database and statements
 	if w.stmtHTTP != nil {
 		_ = w.stmtHTTP.Close()
+		w.stmtHTTP = nil
 	}
 	if w.stmtWebSocket != nil {
 		_ = w.stmtWebSocket.Close()
+		w.stmtWebSocket = nil
 	}
 	if w.stmtSSE != nil {
 		_ = w.stmtSSE.Close()
+		w.stmtSSE = nil
 	}
 	if err := w.db.Close(); err != nil {
 		return err
 	}
+	w.db = nil // Mark as closed
 
 	// Generate rotated filename
 	timestamp := time.Now().Format("20060102_150405")
@@ -1638,26 +1885,27 @@ func (w *SQLiteWriter) rotateInternal() error {
 	}
 	rotatedPath := fmt.Sprintf("%s_%s_%s%s", base, name, timestamp, ext)
 
-	// Rename current file (and WAL/SHM files)
-	if err := os.Rename(w.basePath, rotatedPath); err != nil {
+	// Rename current file with retry for Windows file locking issues
+	var renameErr error
+	for i := range 3 {
+		if i > 0 {
+			time.Sleep(100 * time.Millisecond) // Brief delay for Windows to release file handle
+		}
+		renameErr = os.Rename(w.basePath, rotatedPath)
+		if renameErr == nil {
+			break
+		}
+	}
+	if renameErr != nil {
 		_ = w.openDB()
-		return err
+		return renameErr
 	}
 	_ = os.Remove(w.basePath + "-wal")
 	_ = os.Remove(w.basePath + "-shm")
 
-	// Upload to S3 if configured, delete file after successful upload
+	// Queue for S3 upload if configured (worker handles retry and deletion)
 	if w.uploader != nil {
-		go func() {
-			if err := w.uploader.Upload(rotatedPath); err != nil {
-				log.Printf("S3 upload failed for %s: %v (file retained for retry)", rotatedPath, err)
-			} else {
-				// Successfully uploaded, delete local file
-				if err := os.Remove(rotatedPath); err != nil {
-					log.Printf("failed to delete uploaded file %s: %v", rotatedPath, err)
-				}
-			}
-		}()
+		w.uploader.Queue(rotatedPath)
 	} else {
 		// No S3 configured - enforce local retention
 		w.enforceRetention()
@@ -1669,6 +1917,9 @@ func (w *SQLiteWriter) rotateInternal() error {
 }
 
 func (w *SQLiteWriter) enforceRetention() {
+	if w.retention < 0 {
+		return // Unlimited retention
+	}
 	pattern := strings.TrimSuffix(w.basePath, filepath.Ext(w.basePath)) + "_*" + filepath.Ext(w.basePath)
 	matches, err := filepath.Glob(pattern)
 	if err != nil {
@@ -1719,7 +1970,7 @@ func (w *SQLiteWriter) Close() error {
 
 // ==================== S3 Uploader ====================
 
-func newS3Uploader(bucket, prefix, endpoint string) (*S3Uploader, error) {
+func newS3Uploader(bucket, prefix, endpoint string, patterns []string, verbose bool) (*S3Uploader, error) {
 	ctx := context.Background()
 
 	awsCfg, err := config.LoadDefaultConfig(ctx)
@@ -1734,14 +1985,133 @@ func newS3Uploader(bucket, prefix, endpoint string) (*S3Uploader, error) {
 		}
 	})
 
-	return &S3Uploader{
-		client: client,
-		bucket: bucket,
-		prefix: prefix,
-	}, nil
+	u := &S3Uploader{
+		client:   client,
+		bucket:   bucket,
+		prefix:   prefix,
+		queue:    make(chan string, 100), // Buffer for pending uploads
+		done:     make(chan struct{}),
+		patterns: patterns,
+		verbose:  verbose,
+	}
+
+	// Start single upload worker
+	u.wg.Add(1)
+	go u.uploadWorker()
+
+	// Scan for orphaned files from previous runs
+	u.scanOrphanedFiles()
+
+	return u, nil
 }
 
-func (u *S3Uploader) Upload(filePath string) error {
+// Queue adds a file to the upload queue (non-blocking, drops if full)
+func (u *S3Uploader) Queue(filePath string) {
+	select {
+	case u.queue <- filePath:
+		// Queued successfully
+	default:
+		// Queue full - file will be picked up by periodic scan
+		log.Printf("S3: queue full, %s will be retried later", filePath)
+	}
+}
+
+// Stop gracefully shuts down the uploader, waiting for pending uploads
+func (u *S3Uploader) Stop() {
+	close(u.done)
+	u.wg.Wait()
+}
+
+// uploadWorker is the single goroutine that handles all S3 uploads
+func (u *S3Uploader) uploadWorker() {
+	defer u.wg.Done()
+
+	// Periodic scan interval for orphaned files
+	scanTicker := time.NewTicker(5 * time.Minute)
+	defer scanTicker.Stop()
+
+	for {
+		select {
+		case filePath := <-u.queue:
+			u.uploadWithRetry(filePath)
+
+		case <-scanTicker.C:
+			u.scanOrphanedFiles()
+
+		case <-u.done:
+			// Drain queue before exiting
+			for {
+				select {
+				case filePath := <-u.queue:
+					u.uploadWithRetry(filePath)
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+// uploadWithRetry attempts to upload a file with exponential backoff
+func (u *S3Uploader) uploadWithRetry(filePath string) {
+	const maxRetries = 5
+	const maxBackoff = 5 * time.Minute
+
+	backoff := time.Second
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		// Check if file still exists (might have been uploaded already)
+		if _, err := os.Stat(filePath); os.IsNotExist(err) {
+			return // File already uploaded/deleted
+		}
+
+		err := u.upload(filePath)
+		if err == nil {
+			// Success - delete local file
+			if u.verbose {
+				log.Printf("S3: uploaded %s", filePath)
+			}
+			if err := os.Remove(filePath); err != nil {
+				log.Printf("S3: failed to delete uploaded file %s: %v", filePath, err)
+			}
+			return
+		}
+
+		// Check for shutdown
+		select {
+		case <-u.done:
+			log.Printf("S3: upload of %s interrupted by shutdown", filePath)
+			return
+		default:
+		}
+
+		if attempt < maxRetries {
+			log.Printf("S3: upload failed (attempt %d/%d): %v, retrying in %v",
+				attempt, maxRetries, err, backoff)
+
+			// Wait with shutdown check
+			timer := time.NewTimer(backoff)
+			select {
+			case <-timer.C:
+			case <-u.done:
+				timer.Stop()
+				return
+			}
+
+			// Exponential backoff with cap
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		} else {
+			log.Printf("S3: upload of %s failed after %d attempts, will retry on next scan",
+				filePath, maxRetries)
+		}
+	}
+}
+
+// upload performs the actual S3 upload
+func (u *S3Uploader) upload(filePath string) error {
 	f, err := os.Open(filePath)
 	if err != nil {
 		return err
@@ -1750,7 +2120,10 @@ func (u *S3Uploader) Upload(filePath string) error {
 
 	key := u.prefix + filepath.Base(filePath)
 
-	_, err = u.client.PutObject(context.Background(), &s3.PutObjectInput{
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	_, err = u.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(u.bucket),
 		Key:    aws.String(key),
 		Body:   f,
@@ -1760,8 +2133,31 @@ func (u *S3Uploader) Upload(filePath string) error {
 		return fmt.Errorf("S3 upload failed: %w", err)
 	}
 
-	log.Printf("Uploaded to S3: s3://%s/%s", u.bucket, key)
 	return nil
+}
+
+// scanOrphanedFiles finds rotated files that weren't uploaded (e.g., after crash)
+func (u *S3Uploader) scanOrphanedFiles() {
+	var found, queued int
+	for _, pattern := range u.patterns {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			continue
+		}
+
+		for _, filePath := range matches {
+			found++
+			// Non-blocking queue - if full, next scan will pick it up
+			select {
+			case u.queue <- filePath:
+				queued++
+			default:
+			}
+		}
+	}
+	if found > 0 {
+		log.Printf("S3: found %d orphaned files, queued %d for upload", found, queued)
+	}
 }
 
 // ==================== Log Manager ====================
@@ -1771,7 +2167,13 @@ func newLogManager(writers []LogWriter, rotateInterval time.Duration) *LogManage
 		writers:        writers,
 		rotateInterval: rotateInterval,
 		done:           make(chan struct{}),
+		entryChan:      make(chan any, 10000), // Large buffer - byte limit is the real constraint
+		maxQueuedBytes: 50 * 1024 * 1024,      // 50MB max queued body data (the real limit)
 	}
+
+	// Single writer with batching (simpler, avoids lock contention)
+	lm.wg.Add(1)
+	go lm.batchWriteLoop()
 
 	// Start rotation timer
 	if rotateInterval > 0 {
@@ -1802,27 +2204,147 @@ func (lm *LogManager) rotationLoop() {
 }
 
 func (lm *LogManager) Log(entry any) {
-	// Fire and forget - logging errors should never affect proxy
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				lm.errorCount.Add(1)
-				log.Printf("logging panic recovered: %v", r)
-			}
-		}()
+	// Estimate entry size for memory tracking
+	entryBytes := lm.estimateEntrySize(entry)
 
-		for _, w := range lm.writers {
-			if err := w.Write(entry); err != nil {
-				lm.errorCount.Add(1)
-				log.Printf("log write error: %v", err)
+	// Check memory pressure before queuing
+	if lm.queuedBytes.Load()+entryBytes > lm.maxQueuedBytes {
+		lm.droppedCount.Add(1)
+		return
+	}
+
+	// Non-blocking send with backpressure - drop entries if buffer is full
+	select {
+	case lm.entryChan <- entry:
+		lm.queuedBytes.Add(entryBytes)
+	default:
+		// Buffer full, drop the entry to prevent goroutine accumulation
+		lm.droppedCount.Add(1)
+	}
+}
+
+// Entry size estimation constants (rough approximations for memory tracking)
+const (
+	baseLogEntryOverhead    = 500  // LogEntry struct without body data
+	baseWebSocketOverhead   = 200  // WebSocketFrame struct without payload
+	baseSSEEventOverhead    = 200  // SSEEvent struct without data
+	defaultUnknownEntrySize = 1000 // Conservative default for unknown types
+)
+
+// estimateEntrySize returns approximate memory used by an entry
+func (lm *LogManager) estimateEntrySize(entry any) int64 {
+	switch e := entry.(type) {
+	case *LogEntry:
+		size := int64(baseLogEntryOverhead)
+		if e.Request != nil {
+			size += int64(len(e.Request.Body))
+		}
+		if e.Response != nil {
+			size += int64(len(e.Response.Body))
+		}
+		return size
+	case *WebSocketFrame:
+		return int64(baseWebSocketOverhead + len(e.Payload))
+	case *SSEEvent:
+		return int64(baseSSEEventOverhead + len(e.Data))
+	default:
+		return defaultUnknownEntrySize
+	}
+}
+
+const batchTimeout = 50 * time.Millisecond // Max wait before flushing
+
+func (lm *LogManager) batchWriteLoop() {
+	defer lm.wg.Done()
+
+	batch := make([]any, 0, 1000) // Pre-allocate reasonable default
+	timer := time.NewTimer(batchTimeout)
+	timer.Stop()
+
+	// drainQueue pulls all available entries from channel (non-blocking)
+	drainQueue := func() {
+		for {
+			select {
+			case entry := <-lm.entryChan:
+				batch = append(batch, entry)
+			default:
+				return
 			}
 		}
+	}
+
+	flushBatch := func() {
+		if len(batch) == 0 {
+			return
+		}
+		lm.writeBatch(batch)
+		batch = batch[:0] // Clear, reuse backing array
+	}
+
+	for {
+		select {
+		case entry, ok := <-lm.entryChan:
+			if !ok {
+				flushBatch()
+				return
+			}
+
+			batch = append(batch, entry)
+
+			// Start timer on first entry
+			if len(batch) == 1 {
+				timer.Reset(batchTimeout)
+			}
+
+		case <-timer.C:
+			// Timeout - drain everything pending and flush
+			drainQueue()
+			flushBatch()
+
+		case <-lm.done:
+			timer.Stop()
+			drainQueue()
+			flushBatch()
+			return
+		}
+	}
+}
+
+func (lm *LogManager) writeBatch(entries []any) {
+	if len(entries) == 0 {
+		return
+	}
+
+	// Calculate total bytes for accounting
+	var totalBytes int64
+	for _, e := range entries {
+		totalBytes += lm.estimateEntrySize(e)
+	}
+	defer lm.queuedBytes.Add(-totalBytes)
+
+	defer func() {
+		if r := recover(); r != nil {
+			lm.errorCount.Add(1)
+			log.Printf("logging panic recovered: %v", r)
+		}
 	}()
+
+	for _, w := range lm.writers {
+		if err := w.WriteBatch(entries); err != nil {
+			lm.errorCount.Add(1)
+			log.Printf("batch write error: %v", err)
+		}
+	}
 }
 
 func (lm *LogManager) Stop() {
 	close(lm.done)
 	lm.wg.Wait()
+	close(lm.entryChan)
+
+	if dropped := lm.droppedCount.Load(); dropped > 0 {
+		log.Printf("LogManager: dropped %d entries due to backpressure", dropped)
+	}
 
 	for _, w := range lm.writers {
 		if err := w.Close(); err != nil {
@@ -2269,6 +2791,9 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	closeConns := func() {
 		closeOnce.Do(func() {
 			close(done)
+			// Set immediate deadline to unblock any pending reads (important for Windows)
+			_ = clientConn.SetReadDeadline(time.Now())
+			_ = upstreamConn.SetReadDeadline(time.Now())
 			_ = clientConn.Close()
 			_ = upstreamConn.Close()
 		})
@@ -2280,20 +2805,20 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	// Client -> Upstream
 	wg.Go(func() {
-		relayWebSocketFrames(clientBuf, upstreamConn, connID, "client_to_server", true, p.logManager, p.globalCfg.MaxBodySize, p.name, shouldLog, done)
+		relayWebSocketFrames(clientConn, clientBuf, upstreamConn, connID, "client_to_server", true, p.logManager, p.globalCfg.MaxBodySize, p.name, shouldLog, done)
 		closeConns() // Close both when this direction ends
 	})
 
 	// Upstream -> Client
 	wg.Go(func() {
-		relayWebSocketFrames(upstreamReader, clientConn, connID, "server_to_client", false, p.logManager, p.globalCfg.MaxBodySize, p.name, shouldLog, done)
+		relayWebSocketFrames(upstreamConn, upstreamReader, clientConn, connID, "server_to_client", false, p.logManager, p.globalCfg.MaxBodySize, p.name, shouldLog, done)
 		closeConns() // Close both when this direction ends
 	})
 
 	wg.Wait()
 }
 
-func relayWebSocketFrames(src io.Reader, dst io.Writer, connID, direction string, clientFrames bool, lm *LogManager, maxBodySize int64, routeName string, shouldLog bool, done <-chan struct{}) {
+func relayWebSocketFrames(srcConn net.Conn, src io.Reader, dst io.Writer, connID, direction string, clientFrames bool, lm *LogManager, maxBodySize int64, routeName string, shouldLog bool, done <-chan struct{}) {
 	for {
 		// Check if we should stop
 		select {
@@ -2302,8 +2827,20 @@ func relayWebSocketFrames(src io.Reader, dst io.Writer, connID, direction string
 		default:
 		}
 
+		// Set a read deadline to allow periodic done channel checks (important for Windows shutdown)
+		_ = srcConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+
 		frame, payload, err := readWebSocketFrame(src, clientFrames, maxBodySize)
 		if err != nil {
+			// Check for timeout - this is expected, just check done and continue
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				select {
+				case <-done:
+					return
+				default:
+					continue // Timeout but not done, keep reading
+				}
+			}
 			// Silently ignore expected connection close errors
 			if err != io.EOF && !errors.Is(err, net.ErrClosed) && !isConnectionReset(err) {
 				// Also check if done channel is closed (peer closed)
@@ -2563,6 +3100,8 @@ func (p *Proxy) handleSSE(w http.ResponseWriter, r *http.Request) {
 	var data, id strings.Builder
 	var eventType string
 	var retry *int
+	var dataTruncated bool
+	const maxSSEDataSize = 10 * 1024 * 1024 // 10MB limit per event
 
 	for scanner.Scan() {
 		// Check for client disconnect
@@ -2587,15 +3126,16 @@ func (p *Proxy) handleSSE(w http.ResponseWriter, r *http.Request) {
 			// End of event - log it
 			if shouldLog && data.Len() > 0 {
 				sseEvent := &SSEEvent{
-					ID:           uuid.New().String(),
-					RouteName:    p.name,
-					ConnectionID: connID,
-					Timestamp:    time.Now(),
-					Type:         "sse_event",
-					Event:        eventType,
-					Data:         strings.TrimSuffix(data.String(), "\n"),
-					IDField:      id.String(),
-					Retry:        retry,
+					ID:            uuid.New().String(),
+					RouteName:     p.name,
+					ConnectionID:  connID,
+					Timestamp:     time.Now(),
+					Type:          "sse_event",
+					Event:         eventType,
+					Data:          strings.TrimSuffix(data.String(), "\n"),
+					DataTruncated: dataTruncated,
+					IDField:       id.String(),
+					Retry:         retry,
 				}
 				p.logManager.Log(sseEvent)
 			}
@@ -2605,14 +3145,21 @@ func (p *Proxy) handleSSE(w http.ResponseWriter, r *http.Request) {
 			id.Reset()
 			eventType = "message"
 			retry = nil
+			dataTruncated = false
 			continue
 		}
 
 		if after, ok := strings.CutPrefix(line, "event:"); ok {
 			eventType = strings.TrimSpace(after)
 		} else if after, ok := strings.CutPrefix(line, "data:"); ok {
-			data.WriteString(after)
-			data.WriteByte('\n')
+			// Protect against unbounded growth from malformed SSE
+			if !dataTruncated && data.Len() < maxSSEDataSize {
+				data.WriteString(after)
+				data.WriteByte('\n')
+				if data.Len() >= maxSSEDataSize {
+					dataTruncated = true
+				}
+			}
 		} else if after, ok := strings.CutPrefix(line, "id:"); ok {
 			id.WriteString(strings.TrimSpace(after))
 		} else if after, ok := strings.CutPrefix(line, "retry:"); ok {

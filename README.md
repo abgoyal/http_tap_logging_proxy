@@ -99,7 +99,7 @@ Each `--proxy` flag defines one proxy instance with comma-separated key=value pa
 | `--listen-admin` | | Admin port for health/metrics (recommended: `:9090`) |
 | `--rotate-size` | `100MB` | Rotate when file exceeds size |
 | `--rotate-interval` | `1h` | Rotate at interval |
-| `--retention` | `10` | Number of rotated files to keep (when S3 not configured) |
+| `--retention` | `10` | Number of rotated files to keep; -1 for unlimited (when S3 not configured) |
 | `--max-body-size` | `100MB` | Max request/response body to capture |
 
 ### TLS

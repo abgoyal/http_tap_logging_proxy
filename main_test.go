@@ -1661,8 +1661,9 @@ func TestCreateAdminHandler_Health(t *testing.T) {
 	}
 	startTime := time.Now()
 	cfg := &Config{HealthPath: "/_health", MetricsPath: "/_metrics"}
+	lm := &LogManager{entryChan: make(chan any, 10)}
 
-	handler := createAdminHandler(proxies, startTime, cfg)
+	handler := createAdminHandler(proxies, lm, startTime, cfg)
 
 	// Test health endpoint
 	req := httptest.NewRequest("GET", "/_health", nil)
@@ -1709,8 +1710,9 @@ func TestCreateAdminHandler_Metrics(t *testing.T) {
 
 	startTime := time.Now()
 	cfg := &Config{HealthPath: "/_health", MetricsPath: "/_metrics"}
+	lm := &LogManager{entryChan: make(chan any, 10)}
 
-	handler := createAdminHandler(proxies, startTime, cfg)
+	handler := createAdminHandler(proxies, lm, startTime, cfg)
 
 	// Test metrics endpoint
 	req := httptest.NewRequest("GET", "/_metrics", nil)

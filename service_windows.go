@@ -25,6 +25,7 @@ const serviceDescription = "A transparent HTTP/HTTPS logging proxy"
 // serviceProxies holds the running proxy instances for Windows service mode
 var serviceProxies []*Proxy
 var serviceLogManager *LogManager
+var serviceS3Uploader *S3Uploader
 var serviceAdminServer *http.Server
 var serviceAdminListener net.Listener
 
@@ -36,7 +37,7 @@ func (m *httpTapService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 	changes <- svc.Status{State: svc.StartPending}
 
 	var err error
-	serviceProxies, serviceLogManager, err = initProxies(cfg)
+	serviceProxies, serviceLogManager, serviceS3Uploader, err = initProxies(cfg)
 	if err != nil {
 		log.Printf("Failed to initialize proxies: %v", err)
 		return false, 1
@@ -51,7 +52,7 @@ func (m *httpTapService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 			return false, 1
 		}
 
-		serviceAdminServer = &http.Server{Handler: createAdminHandler(serviceProxies, startTime, cfg)}
+		serviceAdminServer = &http.Server{Handler: createAdminHandler(serviceProxies, serviceLogManager, startTime, cfg)}
 		go func() {
 			if err := serviceAdminServer.Serve(serviceAdminListener); err != http.ErrServerClosed {
 				log.Printf("Admin server error: %v", err)
@@ -81,13 +82,16 @@ func (m *httpTapService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 					_ = serviceAdminServer.Shutdown(ctx)
 					cancel()
 				}
-				// Shutdown all proxies
+				// Shutdown order: proxies first (waits for in-flight requests),
+				// then logManager (flushes pending logs), then S3 (uploads rotated files)
 				for _, p := range serviceProxies {
 					_ = p.Close()
 				}
-				// Stop log manager
 				if serviceLogManager != nil {
 					serviceLogManager.Stop()
+				}
+				if serviceS3Uploader != nil {
+					serviceS3Uploader.Stop()
 				}
 				return
 			default:
