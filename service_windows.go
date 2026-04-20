@@ -5,7 +5,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -39,7 +39,7 @@ func (m *httpTapService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 	var err error
 	serviceProxies, serviceLogManager, serviceS3Uploader, err = initProxies(cfg)
 	if err != nil {
-		log.Printf("Failed to initialize proxies: %v", err)
+		slog.Error("failed to initialize proxies", "error", err)
 		return false, 1
 	}
 
@@ -48,22 +48,22 @@ func (m *httpTapService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 	if cfg.ListenAdmin != "" {
 		serviceAdminListener, err = net.Listen("tcp", cfg.ListenAdmin)
 		if err != nil {
-			log.Printf("Failed to listen on admin port %s: %v", cfg.ListenAdmin, err)
+			slog.Error("failed to listen on admin port", "port", cfg.ListenAdmin, "error", err)
 			return false, 1
 		}
 
 		serviceAdminServer = &http.Server{Handler: createAdminHandler(serviceProxies, serviceLogManager, startTime, cfg)}
 		go func() {
 			if err := serviceAdminServer.Serve(serviceAdminListener); err != http.ErrServerClosed {
-				log.Printf("Admin server error: %v", err)
+				slog.Error("admin server error", "error", err)
 			}
 		}()
-		log.Printf("Admin (health/metrics): %s", serviceAdminListener.Addr().String())
+		slog.Info("admin server listening", "addr", serviceAdminListener.Addr().String())
 	}
 
-	log.Printf("HTTP Tap Proxy v%s started as Windows service", Version)
+	slog.Info("HTTP Tap Proxy started as Windows service", "version", Version)
 	for _, p := range serviceProxies {
-		log.Printf("Proxy %q: upstream=%s", p.name, p.proxyCfg.Upstream)
+		slog.Info("proxy started", "name", p.name, "upstream", p.proxyCfg.Upstream)
 	}
 
 	changes <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
@@ -95,7 +95,7 @@ func (m *httpTapService) Execute(args []string, r <-chan svc.ChangeRequest, chan
 				}
 				return
 			default:
-				log.Printf("unexpected control request #%d", c)
+				slog.Warn("unexpected control request", "cmd", c.Cmd)
 			}
 		}
 	}
@@ -123,16 +123,19 @@ func handleWindowsService(cmd string) {
 func installService() {
 	exePath, err := os.Executable()
 	if err != nil {
-		log.Fatalf("Failed to get executable path: %v", err)
+		slog.Error("failed to get executable path", "error", err)
+		os.Exit(1)
 	}
 	exePath, err = filepath.Abs(exePath)
 	if err != nil {
-		log.Fatalf("Failed to get absolute path: %v", err)
+		slog.Error("failed to get absolute path", "error", err)
+		os.Exit(1)
 	}
 
 	m, err := mgr.Connect()
 	if err != nil {
-		log.Fatalf("Failed to connect to service manager: %v", err)
+		slog.Error("failed to connect to service manager", "error", err)
+		os.Exit(1)
 	}
 	defer m.Disconnect()
 
@@ -140,7 +143,8 @@ func installService() {
 	s, err := m.OpenService(serviceName)
 	if err == nil {
 		s.Close()
-		log.Fatalf("Service %s already exists", serviceName)
+		slog.Error("service already exists", "service", serviceName)
+		os.Exit(1)
 	}
 
 	// Build service arguments
@@ -199,7 +203,8 @@ func installService() {
 		StartType:   mgr.StartAutomatic,
 	}, args...)
 	if err != nil {
-		log.Fatalf("Failed to create service: %v", err)
+		slog.Error("failed to create service", "error", err)
+		os.Exit(1)
 	}
 	defer s.Close()
 
@@ -207,7 +212,8 @@ func installService() {
 	err = eventlog.InstallAsEventCreate(serviceName, eventlog.Error|eventlog.Warning|eventlog.Info)
 	if err != nil {
 		s.Delete()
-		log.Fatalf("Failed to set up event log: %v", err)
+		slog.Error("failed to set up event log", "error", err)
+		os.Exit(1)
 	}
 
 	fmt.Printf("Service %s installed successfully\n", serviceName)
@@ -216,13 +222,15 @@ func installService() {
 func uninstallService() {
 	m, err := mgr.Connect()
 	if err != nil {
-		log.Fatalf("Failed to connect to service manager: %v", err)
+		slog.Error("failed to connect to service manager", "error", err)
+		os.Exit(1)
 	}
 	defer m.Disconnect()
 
 	s, err := m.OpenService(serviceName)
 	if err != nil {
-		log.Fatalf("Service %s not found: %v", serviceName, err)
+		slog.Error("service not found", "service", serviceName, "error", err)
+		os.Exit(1)
 	}
 	defer s.Close()
 
@@ -242,7 +250,8 @@ func uninstallService() {
 
 	err = s.Delete()
 	if err != nil {
-		log.Fatalf("Failed to delete service: %v", err)
+		slog.Error("failed to delete service", "error", err)
+		os.Exit(1)
 	}
 
 	eventlog.Remove(serviceName)
@@ -252,19 +261,22 @@ func uninstallService() {
 func startService() {
 	m, err := mgr.Connect()
 	if err != nil {
-		log.Fatalf("Failed to connect to service manager: %v", err)
+		slog.Error("failed to connect to service manager", "error", err)
+		os.Exit(1)
 	}
 	defer m.Disconnect()
 
 	s, err := m.OpenService(serviceName)
 	if err != nil {
-		log.Fatalf("Service %s not found: %v", serviceName, err)
+		slog.Error("service not found", "service", serviceName, "error", err)
+		os.Exit(1)
 	}
 	defer s.Close()
 
 	err = s.Start()
 	if err != nil {
-		log.Fatalf("Failed to start service: %v", err)
+		slog.Error("failed to start service", "error", err)
+		os.Exit(1)
 	}
 
 	fmt.Printf("Service %s started\n", serviceName)
@@ -273,19 +285,22 @@ func startService() {
 func stopService() {
 	m, err := mgr.Connect()
 	if err != nil {
-		log.Fatalf("Failed to connect to service manager: %v", err)
+		slog.Error("failed to connect to service manager", "error", err)
+		os.Exit(1)
 	}
 	defer m.Disconnect()
 
 	s, err := m.OpenService(serviceName)
 	if err != nil {
-		log.Fatalf("Service %s not found: %v", serviceName, err)
+		slog.Error("service not found", "service", serviceName, "error", err)
+		os.Exit(1)
 	}
 	defer s.Close()
 
 	status, err := s.Control(svc.Stop)
 	if err != nil {
-		log.Fatalf("Failed to stop service: %v", err)
+		slog.Error("failed to stop service", "error", err)
+		os.Exit(1)
 	}
 
 	// Wait for stop
@@ -307,16 +322,18 @@ func runService() {
 	// Running as Windows service
 	isService, err := svc.IsWindowsService()
 	if err != nil {
-		log.Fatalf("Failed to determine if running as service: %v", err)
+		slog.Error("failed to determine if running as service", "error", err)
+		os.Exit(1)
 	}
 
 	if isService {
 		err = svc.Run(serviceName, &httpTapService{})
 		if err != nil {
-			log.Fatalf("Service failed: %v", err)
+			slog.Error("service failed", "error", err)
+			os.Exit(1)
 		}
 	} else {
 		// Not running as service, run normally
-		log.Println("Not running as Windows service, starting normally...")
+		slog.Info("not running as Windows service, starting normally")
 	}
 }

@@ -23,7 +23,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"maps"
 	"math/big"
 	"net"
@@ -52,6 +52,25 @@ import (
 
 // Version information
 const Version = "1.0.0"
+
+// setupLogger configures the global slog logger based on the log level
+func setupLogger(level string) {
+	var lvl slog.Level
+	switch strings.ToLower(level) {
+	case "debug":
+		lvl = slog.LevelDebug
+	case "info":
+		lvl = slog.LevelInfo
+	case "warn", "warning":
+		lvl = slog.LevelWarn
+	case "error":
+		lvl = slog.LevelError
+	default:
+		lvl = slog.LevelInfo
+	}
+	handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})
+	slog.SetDefault(slog.New(handler))
+}
 
 // ProxyConfig holds configuration for a single proxy instance
 type ProxyConfig struct {
@@ -86,7 +105,7 @@ type Config struct {
 	InsecureSkipVerify bool
 	PrintSystemd       bool
 	ServiceCmd         string
-	Verbose            bool
+	LogLevel           string
 	HealthPath         string
 	MetricsPath        string
 }
@@ -258,7 +277,6 @@ type S3Uploader struct {
 	done     chan struct{} // Shutdown signal
 	wg       sync.WaitGroup
 	patterns []string // Glob patterns for rotated files
-	verbose  bool     // Enable verbose logging
 }
 
 // LogManager handles multiple log writers and rotation
@@ -398,7 +416,7 @@ func (p *Proxy) Start() error {
 
 		p.wg.Go(func() {
 			if err := p.httpServer.Serve(listener); err != http.ErrServerClosed {
-				log.Printf("proxy %q: HTTP server error: %v", p.name, err)
+				slog.Error("HTTP server error", "proxy", p.name, "error", err)
 			}
 		})
 	}
@@ -418,7 +436,7 @@ func (p *Proxy) Start() error {
 
 		p.wg.Go(func() {
 			if err := p.httpsServer.Serve(listener); err != http.ErrServerClosed {
-				log.Printf("proxy %q: HTTPS server error: %v", p.name, err)
+				slog.Error("HTTPS server error", "proxy", p.name, "error", err)
 			}
 		})
 	}
@@ -579,9 +597,9 @@ func initProxies(c *Config) ([]*Proxy, *LogManager, *S3Uploader, error) {
 	if c.S3Bucket != "" {
 		patterns := buildS3Patterns(logPaths)
 		var err error
-		s3Uploader, err = newS3Uploader(c.S3Bucket, c.S3Prefix, c.S3Endpoint, patterns, c.Verbose)
+		s3Uploader, err = newS3Uploader(c.S3Bucket, c.S3Prefix, c.S3Endpoint, patterns)
 		if err != nil {
-			log.Printf("WARNING: S3 upload disabled: %v", err)
+			slog.Warn("S3 upload disabled", "error", err)
 		}
 	}
 
@@ -785,6 +803,7 @@ func createAdminHandler(proxies []*Proxy, logManager *LogManager, startTime time
 
 func main() {
 	cfg = parseFlags()
+	setupLogger(cfg.LogLevel)
 
 	// Handle special commands
 	if cfg.PrintSystemd {
@@ -799,7 +818,8 @@ func main() {
 
 	proxies, logManager, s3Uploader, err := initProxies(cfg)
 	if err != nil {
-		log.Fatalf("%v", err)
+		slog.Error("failed to initialize", "error", err)
+		os.Exit(1)
 	}
 
 	// Track process start time for uptime metric
@@ -812,30 +832,31 @@ func main() {
 		var err error
 		adminListener, err = net.Listen("tcp", cfg.ListenAdmin)
 		if err != nil {
-			log.Fatalf("failed to listen on admin port %s: %v", cfg.ListenAdmin, err)
+			slog.Error("failed to listen on admin port", "port", cfg.ListenAdmin, "error", err)
+			os.Exit(1)
 		}
 
 		adminServer = &http.Server{Handler: createAdminHandler(proxies, logManager, startTime, cfg)}
 		go func() {
 			if err := adminServer.Serve(adminListener); err != http.ErrServerClosed {
-				log.Printf("Admin server error: %v", err)
+				slog.Error("admin server error", "error", err)
 			}
 		}()
 	}
 
 	// Print startup info
-	log.Printf("HTTP Tap Proxy v%s started", Version)
+	slog.Info("HTTP Tap Proxy started", "version", Version)
 	for _, p := range proxies {
-		log.Printf("Proxy %q: upstream=%s", p.name, p.proxyCfg.Upstream)
+		slog.Info("proxy configured", "name", p.name, "upstream", p.proxyCfg.Upstream)
 		if p.proxyCfg.ListenHTTP != "" {
-			log.Printf("  HTTP: %s", p.HTTPAddr())
+			slog.Info("listening", "proto", "HTTP", "addr", p.HTTPAddr())
 		}
 		if p.proxyCfg.ListenHTTPS != "" {
-			log.Printf("  HTTPS: %s", p.HTTPSAddr())
+			slog.Info("listening", "proto", "HTTPS", "addr", p.HTTPSAddr())
 		}
 	}
 	if cfg.ListenAdmin != "" && adminListener != nil {
-		log.Printf("Admin (health/metrics): %s", adminListener.Addr().String())
+		slog.Info("admin endpoint", "addr", adminListener.Addr().String())
 	}
 
 	// Wait for shutdown signal
@@ -843,7 +864,7 @@ func main() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
 
-	log.Println("Shutting down...")
+	slog.Info("shutting down...")
 
 	// Shutdown admin server
 	if adminServer != nil {
@@ -865,7 +886,7 @@ func main() {
 		s3Uploader.Stop()
 	}
 
-	log.Println("Shutdown complete")
+	slog.Info("shutdown complete")
 }
 
 // proxyFlag collects multiple --proxy flag values
@@ -966,7 +987,7 @@ func parseFlags() *Config {
 	flag.BoolVar(&cfg.InsecureSkipVerify, "insecure-skip-verify", true, "Skip TLS verification for upstream (default true)")
 	flag.BoolVar(&cfg.PrintSystemd, "print-systemd", false, "Print systemd unit file and exit")
 	flag.StringVar(&cfg.ServiceCmd, "service", "", "Service command: install, uninstall, start, stop (Windows)")
-	flag.BoolVar(&cfg.Verbose, "verbose", false, "Enable verbose logging")
+	flag.StringVar(&cfg.LogLevel, "log-level", "info", "Log level (debug, info, warn, error)")
 
 	// Health and metrics endpoints
 	flag.StringVar(&cfg.HealthPath, "health-path", "/_health", "Path for health check endpoint")
@@ -978,27 +999,31 @@ func parseFlags() *Config {
 	for _, p := range proxies {
 		pc, err := parseProxyFlag(p)
 		if err != nil {
-			log.Fatalf("invalid --proxy flag: %v", err)
+			slog.Error("invalid --proxy flag", "error", err)
+			os.Exit(1)
 		}
 		cfg.Proxies = append(cfg.Proxies, *pc)
 	}
 
 	// Validate we have at least one proxy
 	if len(cfg.Proxies) == 0 && cfg.ServiceCmd == "" && !cfg.PrintSystemd {
-		log.Fatalf("at least one --proxy is required")
+		slog.Error("at least one --proxy is required")
+		os.Exit(1)
 	}
 
 	// Validate proxy count limit
 	const maxProxies = 10
 	if len(cfg.Proxies) > maxProxies {
-		log.Fatalf("too many proxies: %d (maximum is %d)", len(cfg.Proxies), maxProxies)
+		slog.Error("too many proxies", "count", len(cfg.Proxies), "max", maxProxies)
+		os.Exit(1)
 	}
 
 	// Validate no duplicate proxy names
 	seenNames := make(map[string]bool)
 	for _, p := range cfg.Proxies {
 		if seenNames[p.Name] {
-			log.Fatalf("duplicate proxy name: %q", p.Name)
+			slog.Error("duplicate proxy name", "name", p.Name)
+			os.Exit(1)
 		}
 		seenNames[p.Name] = true
 	}
@@ -1008,13 +1033,15 @@ func parseFlags() *Config {
 	for _, p := range cfg.Proxies {
 		if p.ListenHTTP != "" {
 			if existing, ok := seenAddrs[p.ListenHTTP]; ok {
-				log.Fatalf("port conflict: proxy %q and %q both listen on %s", existing, p.Name, p.ListenHTTP)
+				slog.Error("port conflict", "proxy1", existing, "proxy2", p.Name, "addr", p.ListenHTTP)
+				os.Exit(1)
 			}
 			seenAddrs[p.ListenHTTP] = p.Name
 		}
 		if p.ListenHTTPS != "" {
 			if existing, ok := seenAddrs[p.ListenHTTPS]; ok {
-				log.Fatalf("port conflict: proxy %q and %q both listen on %s", existing, p.Name, p.ListenHTTPS)
+				slog.Error("port conflict", "proxy1", existing, "proxy2", p.Name, "addr", p.ListenHTTPS)
+				os.Exit(1)
 			}
 			seenAddrs[p.ListenHTTPS] = p.Name
 		}
@@ -1031,7 +1058,8 @@ func parseFlags() *Config {
 			}
 		}
 		if !hasLogConfig {
-			log.Fatalf("at least one of --log-jsonl or --log-sqlite is required (global or per-proxy)")
+			slog.Error("at least one of --log-jsonl or --log-sqlite is required (global or per-proxy)")
+			os.Exit(1)
 		}
 	}
 
@@ -1039,17 +1067,20 @@ func parseFlags() *Config {
 	var err error
 	cfg.RotateSize, err = parseSize(rotateSizeStr)
 	if err != nil {
-		log.Fatalf("invalid rotate-size: %v", err)
+		slog.Error("invalid rotate-size", "error", err)
+		os.Exit(1)
 	}
 
 	cfg.MaxBodySize, err = parseSize(maxBodySizeStr)
 	if err != nil {
-		log.Fatalf("invalid max-body-size: %v", err)
+		slog.Error("invalid max-body-size", "error", err)
+		os.Exit(1)
 	}
 
 	cfg.RotateInterval, err = time.ParseDuration(rotateIntervalStr)
 	if err != nil {
-		log.Fatalf("invalid rotate-interval: %v", err)
+		slog.Error("invalid rotate-interval", "error", err)
+		os.Exit(1)
 	}
 
 	return cfg
@@ -1108,9 +1139,9 @@ func resolveLogPath(globalPath, routeName, defaultExt string) string {
 	}
 
 	// Warn if path doesn't exist and has no extension (ambiguous: file or dir?)
-	// Only log in verbose mode to avoid cluttering production logs
-	if err != nil && filepath.Ext(globalPath) == "" && cfg != nil && cfg.Verbose {
-		log.Printf("WARNING: log path %q doesn't exist and has no extension - treating as file (use trailing / for directory)", globalPath)
+	// Only log in debug mode to avoid cluttering production logs
+	if err != nil && filepath.Ext(globalPath) == "" && cfg != nil && cfg.LogLevel == "debug" {
+		slog.Warn("log path doesn't exist and has no extension - treating as file (use trailing / for directory)", "path", globalPath)
 	}
 
 	// Otherwise treat as a file path (shared mode)
@@ -1226,7 +1257,7 @@ func (w *JSONLWriter) WriteBatch(entries []any) error {
 
 		data, err := json.Marshal(entry)
 		if err != nil {
-			log.Printf("json marshal error in batch: %v", err)
+			slog.Error("json marshal error in batch", "error", err)
 			continue // Skip bad entries, don't fail batch
 		}
 		buf.Write(data)
@@ -1324,7 +1355,7 @@ func (w *JSONLWriter) enforceRetention() {
 	pattern := strings.TrimSuffix(w.basePath, filepath.Ext(w.basePath)) + "_*" + filepath.Ext(w.basePath)
 	matches, err := filepath.Glob(pattern)
 	if err != nil {
-		log.Printf("retention glob error: %v", err)
+		slog.Error("retention glob error", "error", err)
 		return
 	}
 
@@ -1346,7 +1377,7 @@ func (w *JSONLWriter) enforceRetention() {
 	toDelete := len(matches) - w.retention
 	for i := range toDelete {
 		if err := os.Remove(matches[i]); err != nil {
-			log.Printf("failed to delete old log file %s: %v", matches[i], err)
+			slog.Error("failed to delete old log file", "file", matches[i], "error", err)
 		}
 	}
 }
@@ -1638,7 +1669,7 @@ func (w *SQLiteWriter) WriteBatch(entries []any) error {
 		case *SSEEvent:
 			dataSize, writeErr = w.writeSSEEvent(e)
 		default:
-			log.Printf("unknown entry type in batch: %T", entry)
+			slog.Warn("unknown entry type in batch", "type", fmt.Sprintf("%T", entry))
 			continue // Skip unknown types
 		}
 
@@ -1654,7 +1685,7 @@ func (w *SQLiteWriter) WriteBatch(entries []any) error {
 	// Commit or rollback
 	if batchErr != nil {
 		if _, rollErr := w.db.Exec("ROLLBACK"); rollErr != nil {
-			log.Printf("rollback failed: %v", rollErr)
+			slog.Error("rollback failed", "error", rollErr)
 		}
 		return batchErr
 	}
@@ -1923,7 +1954,7 @@ func (w *SQLiteWriter) enforceRetention() {
 	pattern := strings.TrimSuffix(w.basePath, filepath.Ext(w.basePath)) + "_*" + filepath.Ext(w.basePath)
 	matches, err := filepath.Glob(pattern)
 	if err != nil {
-		log.Printf("retention glob error: %v", err)
+		slog.Error("retention glob error", "error", err)
 		return
 	}
 
@@ -1945,7 +1976,7 @@ func (w *SQLiteWriter) enforceRetention() {
 	toDelete := len(matches) - w.retention
 	for i := range toDelete {
 		if err := os.Remove(matches[i]); err != nil {
-			log.Printf("failed to delete old db file %s: %v", matches[i], err)
+			slog.Error("failed to delete old db file", "file", matches[i], "error", err)
 		}
 	}
 }
@@ -1970,7 +2001,7 @@ func (w *SQLiteWriter) Close() error {
 
 // ==================== S3 Uploader ====================
 
-func newS3Uploader(bucket, prefix, endpoint string, patterns []string, verbose bool) (*S3Uploader, error) {
+func newS3Uploader(bucket, prefix, endpoint string, patterns []string) (*S3Uploader, error) {
 	ctx := context.Background()
 
 	awsCfg, err := config.LoadDefaultConfig(ctx)
@@ -1992,7 +2023,6 @@ func newS3Uploader(bucket, prefix, endpoint string, patterns []string, verbose b
 		queue:    make(chan string, 100), // Buffer for pending uploads
 		done:     make(chan struct{}),
 		patterns: patterns,
-		verbose:  verbose,
 	}
 
 	// Start single upload worker
@@ -2012,7 +2042,7 @@ func (u *S3Uploader) Queue(filePath string) {
 		// Queued successfully
 	default:
 		// Queue full - file will be picked up by periodic scan
-		log.Printf("S3: queue full, %s will be retried later", filePath)
+		slog.Warn("S3: queue full, will retry later", "file", filePath)
 	}
 }
 
@@ -2068,11 +2098,9 @@ func (u *S3Uploader) uploadWithRetry(filePath string) {
 		err := u.upload(filePath)
 		if err == nil {
 			// Success - delete local file
-			if u.verbose {
-				log.Printf("S3: uploaded %s", filePath)
-			}
+			slog.Debug("S3: uploaded", "file", filePath)
 			if err := os.Remove(filePath); err != nil {
-				log.Printf("S3: failed to delete uploaded file %s: %v", filePath, err)
+				slog.Error("S3: failed to delete uploaded file", "file", filePath, "error", err)
 			}
 			return
 		}
@@ -2080,14 +2108,13 @@ func (u *S3Uploader) uploadWithRetry(filePath string) {
 		// Check for shutdown
 		select {
 		case <-u.done:
-			log.Printf("S3: upload of %s interrupted by shutdown", filePath)
+			slog.Warn("S3: upload interrupted by shutdown", "file", filePath)
 			return
 		default:
 		}
 
 		if attempt < maxRetries {
-			log.Printf("S3: upload failed (attempt %d/%d): %v, retrying in %v",
-				attempt, maxRetries, err, backoff)
+			slog.Warn("S3: upload failed, retrying", "attempt", attempt, "maxRetries", maxRetries, "error", err, "backoff", backoff)
 
 			// Wait with shutdown check
 			timer := time.NewTimer(backoff)
@@ -2104,8 +2131,7 @@ func (u *S3Uploader) uploadWithRetry(filePath string) {
 				backoff = maxBackoff
 			}
 		} else {
-			log.Printf("S3: upload of %s failed after %d attempts, will retry on next scan",
-				filePath, maxRetries)
+			slog.Error("S3: upload failed after max attempts, will retry on next scan", "file", filePath, "attempts", maxRetries)
 		}
 	}
 }
@@ -2156,7 +2182,7 @@ func (u *S3Uploader) scanOrphanedFiles() {
 		}
 	}
 	if found > 0 {
-		log.Printf("S3: found %d orphaned files, queued %d for upload", found, queued)
+		slog.Info("S3: found orphaned files", "found", found, "queued", queued)
 	}
 }
 
@@ -2194,7 +2220,7 @@ func (lm *LogManager) rotationLoop() {
 		case <-ticker.C:
 			for _, w := range lm.writers {
 				if err := w.Rotate(); err != nil {
-					log.Printf("rotation error: %v", err)
+					slog.Error("rotation error", "error", err)
 				}
 			}
 		case <-lm.done:
@@ -2325,14 +2351,14 @@ func (lm *LogManager) writeBatch(entries []any) {
 	defer func() {
 		if r := recover(); r != nil {
 			lm.errorCount.Add(1)
-			log.Printf("logging panic recovered: %v", r)
+			slog.Error("logging panic recovered", "panic", r)
 		}
 	}()
 
 	for _, w := range lm.writers {
 		if err := w.WriteBatch(entries); err != nil {
 			lm.errorCount.Add(1)
-			log.Printf("batch write error: %v", err)
+			slog.Error("batch write error", "error", err)
 		}
 	}
 }
@@ -2343,12 +2369,12 @@ func (lm *LogManager) Stop() {
 	close(lm.entryChan)
 
 	if dropped := lm.droppedCount.Load(); dropped > 0 {
-		log.Printf("LogManager: dropped %d entries due to backpressure", dropped)
+		slog.Warn("LogManager: dropped entries due to backpressure", "dropped", dropped)
 	}
 
 	for _, w := range lm.writers {
 		if err := w.Close(); err != nil {
-			log.Printf("error closing log writer: %v", err)
+			slog.Error("error closing log writer", "error", err)
 		}
 	}
 }
@@ -2664,7 +2690,7 @@ func (p *Proxy) createReverseProxy() *httputil.ReverseProxy {
 
 	// Error handler - ensure we don't break client connection
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		log.Printf("proxy %q error: %v", p.name, err)
+		slog.Error("proxy error", "proxy", p.name, "error", err)
 		// Return 502 Bad Gateway but don't panic
 		w.WriteHeader(http.StatusBadGateway)
 		_, _ = w.Write([]byte("Bad Gateway"))
@@ -2718,7 +2744,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
-		log.Printf("WebSocket upstream dial error: %v", err)
+		slog.Error("WebSocket upstream dial error", "error", err)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		p.metrics.ErrorsTotal.Add(1)
 		return
@@ -2738,7 +2764,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	upgradeReq.WriteString("\r\n")
 
 	if _, err := upstreamConn.Write([]byte(upgradeReq.String())); err != nil {
-		log.Printf("WebSocket upstream write error: %v", err)
+		slog.Error("WebSocket upstream write error", "error", err)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		_ = upstreamConn.Close()
 		p.metrics.ErrorsTotal.Add(1)
@@ -2749,7 +2775,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	upstreamReader := bufio.NewReader(upstreamConn)
 	upstreamResp, err := http.ReadResponse(upstreamReader, r)
 	if err != nil {
-		log.Printf("WebSocket upstream response error: %v", err)
+		slog.Error("WebSocket upstream response error", "error", err)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		_ = upstreamConn.Close()
 		p.metrics.ErrorsTotal.Add(1)
@@ -2757,7 +2783,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if upstreamResp.StatusCode != http.StatusSwitchingProtocols {
-		log.Printf("WebSocket upstream refused upgrade: %d", upstreamResp.StatusCode)
+		slog.Error("WebSocket upstream refused upgrade", "status", upstreamResp.StatusCode)
 		w.WriteHeader(upstreamResp.StatusCode)
 		_ = upstreamConn.Close()
 		return
@@ -2766,7 +2792,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Hijack client connection
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
-		log.Printf("WebSocket hijack not supported")
+		slog.Error("WebSocket hijack not supported")
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		_ = upstreamConn.Close()
 		return
@@ -2774,7 +2800,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	clientConn, clientBuf, err := hijacker.Hijack()
 	if err != nil {
-		log.Printf("WebSocket hijack error: %v", err)
+		slog.Error("WebSocket hijack error", "error", err)
 		_ = upstreamConn.Close()
 		return
 	}
@@ -2848,7 +2874,7 @@ func relayWebSocketFrames(srcConn net.Conn, src io.Reader, dst io.Writer, connID
 				case <-done:
 					return
 				default:
-					log.Printf("WebSocket read error: %v", err)
+					slog.Error("WebSocket read error", "error", err)
 				}
 			}
 			return
@@ -2883,7 +2909,7 @@ func relayWebSocketFrames(srcConn net.Conn, src io.Reader, dst io.Writer, connID
 				case <-done:
 					return
 				default:
-					log.Printf("WebSocket write error: %v", err)
+					slog.Error("WebSocket write error", "error", err)
 				}
 			}
 			return
@@ -3053,7 +3079,7 @@ func (p *Proxy) handleSSE(w http.ResponseWriter, r *http.Request) {
 
 	upstreamReq, err := http.NewRequestWithContext(ctx, r.Method, upstreamURL.String(), r.Body)
 	if err != nil {
-		log.Printf("SSE upstream request error: %v", err)
+		slog.Error("SSE upstream request error", "error", err)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		p.metrics.ErrorsTotal.Add(1)
 		return
@@ -3069,7 +3095,7 @@ func (p *Proxy) handleSSE(w http.ResponseWriter, r *http.Request) {
 		if ctx.Err() != nil {
 			return // Client disconnected, silently return
 		}
-		log.Printf("SSE upstream error: %v", err)
+		slog.Error("SSE upstream error", "error", err)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		p.metrics.ErrorsTotal.Add(1)
 		return
@@ -3172,7 +3198,7 @@ func (p *Proxy) handleSSE(w http.ResponseWriter, r *http.Request) {
 
 	if err := scanner.Err(); err != nil && err != io.EOF && !isConnectionReset(err) {
 		if ctx.Err() == nil { // Only log if not client-initiated cancellation
-			log.Printf("SSE scan error: %v", err)
+			slog.Error("SSE scan error", "error", err)
 		}
 	}
 }
